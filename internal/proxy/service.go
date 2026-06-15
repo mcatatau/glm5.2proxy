@@ -341,11 +341,33 @@ func normalizeError(payload map[string]any, status int) *UpstreamError {
 }
 
 func overloaded(err error) bool {
+	if IsAdmissionConcurrency(err) {
+		return true
+	}
 	var upstreamError *UpstreamError
 	if !errors.As(err, &upstreamError) {
 		return false
 	}
 	return fmt.Sprint(upstreamError.Code) == "1305" || upstreamError.Type == "overloaded_error" || strings.Contains(upstreamError.Message, "[1305]")
+}
+
+func IsAdmissionConcurrency(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	var upstreamError *UpstreamError
+	if errors.As(err, &upstreamError) {
+		text += " " + strings.ToLower(strings.Join([]string{
+			upstreamError.Message,
+			upstreamError.Type,
+			fmt.Sprint(upstreamError.Code),
+		}, " "))
+	}
+	return strings.Contains(text, "admission concurrency") ||
+		strings.Contains(text, "model admission concurrency") ||
+		strings.Contains(text, "concurrency limit exceeded") ||
+		strings.Contains(text, "model concurrency limit exceeded")
 }
 
 func IsQuotaExhausted(err error) bool {
@@ -361,7 +383,10 @@ func IsQuotaExhausted(err error) bool {
 	if upstreamError.Status != http.StatusTooManyRequests && upstreamError.Status != http.StatusForbidden && upstreamError.Status != http.StatusPaymentRequired {
 		return false
 	}
-	for _, marker := range []string{"quota", "exhaust", "limit", "insufficient", "balance", "credit", "available", "usage", "tokens"} {
+	if IsAdmissionConcurrency(err) {
+		return false
+	}
+	for _, marker := range []string{"quota", "exhaust", "insufficient", "balance", "credit", "available", "usage", "tokens"} {
 		if strings.Contains(text, marker) {
 			return true
 		}

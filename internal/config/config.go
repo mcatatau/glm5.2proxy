@@ -75,7 +75,7 @@ func Load() Config {
 		HeadlessProfileDir:     env("ZCODE_CAPTCHA_HEADLESS_PROFILE_DIR", filepath.Join(dataDir, "captcha-headless-profile")),
 		HeadlessRestartDelay:   envDurationMS("ZCODE_CAPTCHA_HEADLESS_RESTART_DELAY_MS", 3000),
 		UpstreamTimeout:        envDurationMS("ZCODE_UPSTREAM_TIMEOUT_MS", 300000),
-		RetryMaxAttempts:       envInt("ZCODE_RETRY_MAX_ATTEMPTS", 4),
+		RetryMaxAttempts:       envInt("ZCODE_RETRY_MAX_ATTEMPTS", 8),
 		RetryBaseDelay:         envDurationMS("ZCODE_RETRY_BASE_DELAY_MS", 10000),
 		RetryMaxDelay:          envDurationMS("ZCODE_RETRY_MAX_DELAY_MS", 45000),
 		AccountRotation:        enabled("ZCODE_ACCOUNT_ROTATION", true),

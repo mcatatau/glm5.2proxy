@@ -62,6 +62,69 @@ func TestCaptchaBridgeAndProxyRetry(t *testing.T) {
 	}
 }
 
+func TestProxyRetriesAdmissionConcurrencyLimit(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.CaptchaEnabled = false
+	cfg.RetryBaseDelay = time.Millisecond
+	var attempts atomic.Int32
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"type":"zcode_upstream_error","message":"model admission concurrency limit exceeded"}}`))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer mock.Close()
+
+	service := proxy.New(cfg, captcha.NewBridge(cfg))
+	completion, _, err := service.Collect(context.Background(), upstream.Config{Endpoint: mock.URL, BaseHeaders: map[string]string{"authorization": "Bearer test"}, HasAuthorization: true}, map[string]any{"model": "GLM-5.2"})
+	if err != nil || completion.Text != "ok" || attempts.Load() != 2 {
+		t.Fatalf("admission retry failed: completion=%+v attempts=%d err=%v", completion, attempts.Load(), err)
+	}
+}
+
+func TestProxyStreamRetriesAdmissionConcurrencyLimit(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.CaptchaEnabled = false
+	cfg.RetryBaseDelay = time.Millisecond
+	var attempts atomic.Int32
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"model admission concurrency limit exceeded"}}`))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"stream ok\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer mock.Close()
+
+	service := proxy.New(cfg, captcha.NewBridge(cfg))
+	var text string
+	streamAttempts, err := service.Stream(context.Background(), upstream.Config{Endpoint: mock.URL, BaseHeaders: map[string]string{"authorization": "Bearer test"}, HasAuthorization: true}, map[string]any{"model": "GLM-5.2"}, func(event proxy.StreamEvent) error {
+		if content, ok := event.Delta["content"].(string); ok {
+			text += content
+		}
+		return nil
+	})
+	if err != nil || text != "stream ok" || attempts.Load() != 2 || streamAttempts != 2 {
+		t.Fatalf("stream admission retry failed: text=%q attempts=%d streamAttempts=%d err=%v", text, attempts.Load(), streamAttempts, err)
+	}
+}
+
+func TestAdmissionConcurrencyIsNotQuotaExhausted(t *testing.T) {
+	err := &proxy.UpstreamError{Status: http.StatusTooManyRequests, Message: "model admission concurrency limit exceeded"}
+	if proxy.IsQuotaExhausted(err) {
+		t.Fatal("admission concurrency should wait/retry, not rotate as quota exhaustion")
+	}
+}
+
 func TestProxyStreamingEvents(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.CaptchaEnabled = false
