@@ -15,7 +15,11 @@ func ToAnthropic(body map[string]any, template map[string]any, model models.Mode
 		out = map[string]any{}
 	}
 	out["model"] = model.UpstreamID
-	out["max_tokens"] = numberOr(body["max_tokens"], numberOr(body["max_completion_tokens"], numberOr(out["max_tokens"], float64(defaultMaxTokens))))
+	maxTokens := numberOr(body["max_tokens"], numberOr(body["max_completion_tokens"], numberOr(out["max_tokens"], float64(defaultMaxTokens))))
+	if maxTokens < 1 {
+		maxTokens = float64(defaultMaxTokens)
+	}
+	out["max_tokens"] = maxTokens
 	out["stream"] = true
 	system, messages := convertMessages(array(body["messages"]), template != nil)
 	out["messages"] = messages
@@ -32,16 +36,22 @@ func ToAnthropic(body map[string]any, template map[string]any, model models.Mode
 		delete(out, "tools")
 		delete(out, "tool_choice")
 	}
-	if thinking.Enabled {
-		out["thinking"] = map[string]any{"type": "enabled", "budget_tokens": thinking.BudgetTokens}
+	thinkingBudget := adjustedThinkingBudget(thinking, int(maxTokens))
+	if thinkingBudget > 0 {
+		out["thinking"] = map[string]any{"type": "enabled", "budget_tokens": thinkingBudget}
 		out["output_config"] = map[string]any{"effort": thinking.Effort}
 	} else {
 		delete(out, "thinking")
 		delete(out, "output_config")
 	}
-	for _, key := range []string{"temperature", "top_p"} {
-		if _, ok := body[key].(float64); ok {
-			out[key] = body[key]
+	if thinkingBudget > 0 {
+		delete(out, "temperature")
+		delete(out, "top_p")
+	} else {
+		for _, key := range []string{"temperature", "top_p"} {
+			if _, ok := body[key].(float64); ok {
+				out[key] = body[key]
+			}
 		}
 	}
 	switch stop := body["stop"].(type) {
@@ -51,6 +61,20 @@ func ToAnthropic(body map[string]any, template map[string]any, model models.Mode
 		out["stop_sequences"] = stop
 	}
 	return out
+}
+
+func adjustedThinkingBudget(thinking state.ThinkingSettings, maxTokens int) int {
+	if !thinking.Enabled || thinking.BudgetTokens <= 0 || maxTokens <= 1024 {
+		return 0
+	}
+	budget := thinking.BudgetTokens
+	if maximum := maxTokens / 2; budget > maximum {
+		budget = maximum
+	}
+	if budget < 1024 {
+		return 0
+	}
+	return budget
 }
 
 func convertMessages(input []any, forceBlocks bool) ([]any, []any) {
