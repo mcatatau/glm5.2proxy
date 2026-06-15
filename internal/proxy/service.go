@@ -348,6 +348,27 @@ func overloaded(err error) bool {
 	return fmt.Sprint(upstreamError.Code) == "1305" || upstreamError.Type == "overloaded_error" || strings.Contains(upstreamError.Message, "[1305]")
 }
 
+func IsQuotaExhausted(err error) bool {
+	var upstreamError *UpstreamError
+	if !errors.As(err, &upstreamError) {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{
+		upstreamError.Message,
+		upstreamError.Type,
+		fmt.Sprint(upstreamError.Code),
+	}, " "))
+	if upstreamError.Status != http.StatusTooManyRequests && upstreamError.Status != http.StatusForbidden && upstreamError.Status != http.StatusPaymentRequired {
+		return false
+	}
+	for _, marker := range []string{"quota", "exhaust", "limit", "insufficient", "balance", "credit", "available", "usage", "tokens"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Service) wait(ctx context.Context, attempt int, reason string) {
 	delay := s.cfg.RetryBaseDelay * time.Duration(attempt)
 	if delay > s.cfg.RetryMaxDelay {

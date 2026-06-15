@@ -40,6 +40,10 @@ func New(cfg config.Config, store *accounts.Store, loader *upstream.Loader, quot
 }
 
 func (p *Pool) Select(ctx context.Context, model models.Model) Selection {
+	return p.SelectSkipping(ctx, model, nil)
+}
+
+func (p *Pool) SelectSkipping(ctx context.Context, model models.Model, skip map[string]bool) Selection {
 	fallback := p.loader.Load(nil)
 	if !p.cfg.AccountRotation || p.cfg.Authorization != "" {
 		return Selection{Config: fallback}
@@ -57,6 +61,9 @@ func (p *Pool) Select(ctx context.Context, model models.Model) Selection {
 	}
 	results := make([]inspected, 0, len(ordered))
 	for _, account := range ordered {
+		if skip[account.ID] {
+			continue
+		}
 		upstreamConfig := p.loader.Load(&account)
 		balance, err := p.quota.ModelBalance(ctx, upstreamConfig, model)
 		exhausted := balance != nil && balance.Available != nil && *balance.Available < p.cfg.AccountMinAvailable
@@ -74,6 +81,9 @@ func (p *Pool) Select(ctx context.Context, model models.Model) Selection {
 			}
 			return Selection{Config: upstreamConfig, Account: &account, Balance: balance, Rotated: rotated}
 		}
+	}
+	if len(results) == 0 {
+		return Selection{Config: fallback, AllExhausted: true}
 	}
 	for _, result := range results {
 		if result.err != nil {

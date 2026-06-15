@@ -172,72 +172,96 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unsupported model", "invalid_request_error")
 		return
 	}
-	selection := s.pool.Select(r.Context(), model)
-	if selection.AllExhausted {
-		writeError(w, http.StatusTooManyRequests, "all saved ZCode accounts have exhausted quota for "+model.ID, "zcode_all_accounts_exhausted")
-		return
-	}
-	if !selection.Config.HasAuthorization {
-		writeError(w, http.StatusInternalServerError, "missing ZCode Authorization", "zcode_auth_missing")
-		return
-	}
-	accountID := ""
-	if selection.Account != nil {
-		accountID = selection.Account.ID
-	}
-	queueKey := requestqueue.Key(accountID, model.ID)
-	thinking := s.admin.ThinkingFor(accountID)
-	upstreamBody := openai.ToAnthropic(body, selection.Config.BodyTemplate, model, thinking, s.cfg.DefaultMaxTokens)
 	requestID := randomID()
-	s.logs.add("info", "chat.started", fmt.Sprintf("Request %s iniciado com %s usando conta %s", requestID, model.ID, accountID))
-	before, _ := s.quota.ModelBalance(r.Context(), selection.Config, model)
-	lease, err := s.queue.Acquire(r.Context(), queueKey)
-	if err != nil {
-		s.logs.add("warn", "chat.cancelled", fmt.Sprintf("Request %s cancelado enquanto aguardava fila %s: %v", requestID, queueKey, err))
-		writeError(w, http.StatusRequestTimeout, "request cancelled while waiting for account/model queue", "zcode_queue_cancelled")
-		return
-	}
-	defer lease.Release()
-	if lease.Position() > 0 {
-		s.logs.add("info", "queue.released", fmt.Sprintf("Request %s liberado apos aguardar fila %s", requestID, queueKey))
-	}
-	onSuccess := func() {
-		s.logs.add("info", "chat.completed", fmt.Sprintf("Request %s concluído com %s", requestID, model.ID))
-		if s.cfg.QuotaLog {
-			go s.logQuota(requestID, selection.Config, model, before)
+	skipped := map[string]bool{}
+	for {
+		selection := s.pool.SelectSkipping(r.Context(), model, skipped)
+		if selection.AllExhausted {
+			writeError(w, http.StatusTooManyRequests, "all saved ZCode accounts have exhausted quota for "+model.ID, "zcode_all_accounts_exhausted")
+			return
 		}
-	}
-	if streaming(body) {
-		s.streamChat(w, r, selection.Config, upstreamBody, model, onSuccess)
+		if !selection.Config.HasAuthorization {
+			writeError(w, http.StatusInternalServerError, "missing ZCode Authorization", "zcode_auth_missing")
+			return
+		}
+		accountID := ""
+		if selection.Account != nil {
+			accountID = selection.Account.ID
+		}
+		queueKey := requestqueue.Key(accountID, model.ID)
+		thinking := s.admin.ThinkingFor(accountID)
+		upstreamBody := openai.ToAnthropic(body, selection.Config.BodyTemplate, model, thinking, s.cfg.DefaultMaxTokens)
+		s.logs.add("info", "chat.started", fmt.Sprintf("Request %s iniciado com %s usando conta %s", requestID, model.ID, accountID))
+		before, _ := s.quota.ModelBalance(r.Context(), selection.Config, model)
+		lease, err := s.queue.Acquire(r.Context(), queueKey)
+		if err != nil {
+			s.logs.add("warn", "chat.cancelled", fmt.Sprintf("Request %s cancelado enquanto aguardava fila %s: %v", requestID, queueKey, err))
+			writeError(w, http.StatusRequestTimeout, "request cancelled while waiting for account/model queue", "zcode_queue_cancelled")
+			return
+		}
+		if lease.Position() > 0 {
+			s.logs.add("info", "queue.released", fmt.Sprintf("Request %s liberado apos aguardar fila %s", requestID, queueKey))
+		}
+		onSuccess := func() {
+			s.logs.add("info", "chat.completed", fmt.Sprintf("Request %s concluido com %s", requestID, model.ID))
+			if s.cfg.QuotaLog {
+				go s.logQuota(requestID, selection.Config, model, before)
+			}
+		}
+		if streaming(body) {
+			attempts, err, started := s.streamChat(w, r, selection.Config, upstreamBody, model, onSuccess)
+			lease.Release()
+			if err == nil {
+				return
+			}
+			if !started && s.skipQuotaExhaustedAccount(requestID, accountID, model, err, skipped) {
+				continue
+			}
+			s.logs.add("error", "chat.failed", fmt.Sprintf("Streaming falhou apos %d tentativa(s): %v", attempts, err))
+			writeProxyError(w, err, attempts)
+			return
+		}
+		completion, attempts, err := s.proxy.Collect(r.Context(), selection.Config, upstreamBody)
+		lease.Release()
+		if err != nil {
+			if s.skipQuotaExhaustedAccount(requestID, accountID, model, err, skipped) {
+				continue
+			}
+			s.logs.add("error", "chat.failed", fmt.Sprintf("Request %s falhou apos %d tentativa(s): %v", requestID, attempts, err))
+			writeProxyError(w, err, attempts)
+			return
+		}
+		message := map[string]any{"role": "assistant", "content": completion.Text}
+		if len(completion.ToolCalls) > 0 {
+			message["tool_calls"] = completion.ToolCalls
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": "chatcmpl-" + randomID(), "object": "chat.completion", "created": time.Now().Unix(), "model": model.ID, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": completion.FinishReason}}, "usage": nil})
+		onSuccess()
 		return
 	}
-	completion, attempts, err := s.proxy.Collect(r.Context(), selection.Config, upstreamBody)
-	if err != nil {
-		s.logs.add("error", "chat.failed", fmt.Sprintf("Request %s falhou após %d tentativa(s): %v", requestID, attempts, err))
-		writeProxyError(w, err, attempts)
-		return
-	}
-	message := map[string]any{"role": "assistant", "content": completion.Text}
-	if len(completion.ToolCalls) > 0 {
-		message["tool_calls"] = completion.ToolCalls
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"id": "chatcmpl-" + randomID(), "object": "chat.completion", "created": time.Now().Unix(), "model": model.ID, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": completion.FinishReason}}, "usage": nil})
-	onSuccess()
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, upstreamConfig upstream.Config, body map[string]any, model models.Model, onSuccess func()) {
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, upstreamConfig upstream.Config, body map[string]any, model models.Model, onSuccess func()) (int, error, bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported", "internal_error")
-		return
+		return 0, nil, true
 	}
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
+	started := false
+	start := func() {
+		if started {
+			return
+		}
+		started = true
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+	}
 	id := "chatcmpl-" + randomID()
 	finalSent := false
-	_, err := s.proxy.Stream(r.Context(), upstreamConfig, body, func(event proxy.StreamEvent) error {
+	attempts, err := s.proxy.Stream(r.Context(), upstreamConfig, body, func(event proxy.StreamEvent) error {
+		start()
 		if event.FinishReason != "" {
 			if finalSent {
 				return nil
@@ -250,18 +274,31 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, upstreamConf
 		return nil
 	})
 	if err != nil {
-		s.logs.add("error", "chat.failed", fmt.Sprintf("Streaming falhou: %v", err))
+		if !started {
+			return attempts, err, false
+		}
 		writeSSE(w, map[string]any{"error": errorPayload(err)})
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
-		return
+		return attempts, nil, true
 	}
+	start()
 	if !finalSent {
 		writeSSE(w, map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model.ID, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}})
 	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	onSuccess()
+	return attempts, nil, true
+}
+
+func (s *Server) skipQuotaExhaustedAccount(requestID, accountID string, model models.Model, err error, skipped map[string]bool) bool {
+	if accountID == "" || skipped[accountID] || !proxy.IsQuotaExhausted(err) {
+		return false
+	}
+	skipped[accountID] = true
+	s.logs.add("warn", "account.quota_exhausted", fmt.Sprintf("Request %s detectou cota esgotada para %s na conta %s; tentando pr?xima conta", requestID, model.ID, accountID))
+	return true
 }
 
 func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {

@@ -38,6 +38,11 @@ export function Home() {
 
   const activeAccountId = accountsData?.activeAccountId ?? null
   const settings = settingsState.settings
+  const apiStatusText = settings?.apiEnabled
+    ? settings.apiKeys.length > 0
+      ? `${settings.apiKeys.length} API key${settings.apiKeys.length === 1 ? '' : 's'} local${settings.apiKeys.length === 1 ? '' : 's'} - /v1/chat/completions disponivel`
+      : 'Sem API key local - localhost liberado - /v1/chat/completions disponivel'
+    : 'O painel continua funcionando; clientes /v1 recebem API indisponivel'
 
   const persistOrder = async (ordered: Account[]) => {
     setAccounts(ordered)
@@ -99,11 +104,7 @@ export function Home() {
                 </div>
                 <div>
                   <p className="text-sm font-semibold">{settings.apiEnabled ? 'API OpenAI ativa' : 'API OpenAI parada'}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {settings.apiEnabled
-                      ? `${settings.apiKeys.length || 'Nenhuma'} chave configurada · /v1/chat/completions disponível`
-                      : 'O painel continua funcionando; clientes /v1 recebem API indisponível'}
-                  </p>
+                  <p className="text-xs text-muted-foreground">{apiStatusText}</p>
                 </div>
               </div>
               <Button
@@ -120,7 +121,7 @@ export function Home() {
               <div>
                 <h1 className="text-2xl font-semibold">Fila de contas</h1>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  {loading ? 'Consultando contas e cotas...' : `${accounts.length} conta${accounts.length === 1 ? '' : 's'} · arraste pelo puxador para reordenar`}
+                  {loading ? 'Consultando contas e cotas...' : `${accounts.length} conta${accounts.length === 1 ? '' : 's'} - arraste pelo puxador para reordenar`}
                 </p>
               </div>
               <div className="flex gap-2">

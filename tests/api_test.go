@@ -137,6 +137,64 @@ func TestChatRequestsAreQueuedPerDefaultAccountAndModel(t *testing.T) {
 	}
 }
 
+func TestChatRotatesAccountWhenUpstreamReportsQuotaExhausted(t *testing.T) {
+	var chatTokens []string
+	fakeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/messages":
+			token := r.Header.Get("Authorization")
+			chatTokens = append(chatTokens, token)
+			if token == "Bearer token-one" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"message":"quota exhausted for model","type":"quota_exhausted","code":"quota_exhausted"}}`))
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case r.URL.Path == "/billing/balance":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"balances":[{"show_name":"GLM-5.2","total_units":3000000,"used_units":0,"remaining_units":3000000,"available_units":3000000}]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fakeUpstream.Close()
+
+	cfg := testConfig(t)
+	cfg.UpstreamURL = fakeUpstream.URL + "/messages"
+	cfg.BillingBaseURL = fakeUpstream.URL + "/billing"
+	admin, _ := state.NewAdminStore(cfg.AdminPath, 3005, state.ThinkingSettings{Enabled: true, BudgetTokens: 32000, Effort: "max"})
+	accountStore, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	_, _ = accountStore.Upsert(accounts.User{UserID: "one"}, "token-one", "")
+	_, _ = accountStore.Upsert(accounts.User{UserID: "two"}, "token-two", "")
+	loader := upstream.NewLoader(cfg, accountStore)
+	quotaService := quota.New(cfg)
+	bridge := captcha.NewBridge(cfg)
+	browser := captcha.NewBrowserManager(cfg, 3005)
+	server := api.New(cfg, 3005, admin, accountStore, auth.New(cfg, accountStore), quotaService, accountpool.New(cfg, accountStore, loader, quotaService), loader, bridge, browser, proxy.New(cfg, bridge))
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"oi"}],"stream":false}`)
+	response, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected rotated request to succeed, got %d", response.StatusCode)
+	}
+	if strings.Join(chatTokens, ",") != "Bearer token-one,Bearer token-two" {
+		t.Fatalf("request did not rotate across accounts: %+v", chatTokens)
+	}
+	if active := accountStore.Active(); active == nil || active.ID != "two" {
+		t.Fatalf("rotated account was not persisted as active: %+v", active)
+	}
+}
+
 func TestAPIStateReorderAndLogs(t *testing.T) {
 	cfg := testConfig(t)
 	admin, _ := state.NewAdminStore(cfg.AdminPath, 3005, state.ThinkingSettings{Enabled: true, BudgetTokens: 32000, Effort: "max"})
