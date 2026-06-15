@@ -67,3 +67,42 @@ func TestOAuthQuotaAndAccountRotation(t *testing.T) {
 		t.Fatalf("wrong active account/token: active=%+v token=%s", store.Active(), chatToken)
 	}
 }
+
+func TestAccountPoolRotatesBeforeChatWhenActiveQuotaIsExhausted(t *testing.T) {
+	var checkedTokens []string
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/billing/balance" {
+			http.NotFound(w, r)
+			return
+		}
+		token := r.Header.Get("Authorization")
+		checkedTokens = append(checkedTokens, token)
+		available := 0
+		if token == "Bearer token-two" {
+			available = 1000
+		}
+		json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"balances": []any{map[string]any{"show_name": "GLM-5.2", "total_units": 1000, "used_units": 1000 - available, "remaining_units": available, "available_units": available}}}})
+	}))
+	defer mock.Close()
+
+	cfg := testConfig(t)
+	cfg.BillingBaseURL = mock.URL + "/billing"
+	store, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	_, _ = store.Upsert(accounts.User{UserID: "one"}, "token-one", "")
+	_, _ = store.Upsert(accounts.User{UserID: "two"}, "token-two", "")
+
+	loader := upstream.NewLoader(cfg, store)
+	pool := accountpool.New(cfg, store, loader, quota.New(cfg))
+	model, _ := models.Resolve("glm-5.2")
+	selection := pool.Select(context.Background(), model)
+	if selection.Account == nil || selection.Account.ID != "two" || !selection.Rotated {
+		t.Fatalf("expected exhausted active account to rotate to account two: %+v", selection)
+	}
+	if store.Active().ID != "two" {
+		t.Fatalf("rotated account was not persisted active: %+v", store.Active())
+	}
+	if len(checkedTokens) != 2 || checkedTokens[0] != "Bearer token-one" || checkedTokens[1] != "Bearer token-two" {
+		t.Fatalf("unexpected quota check order: %+v", checkedTokens)
+	}
+}

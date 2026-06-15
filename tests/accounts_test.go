@@ -54,12 +54,18 @@ func TestAccountStoreReorderPersistsQueueOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, err := store.Activate("two"); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Reorder([]string{"three", "one", "two"}); err != nil {
 		t.Fatal(err)
 	}
-	_, public := store.Public()
+	activeID, public := store.Public()
 	if public[0].ID != "three" || public[0].QueuePosition != 1 || public[0].Label != "Conta 1" {
 		t.Fatalf("unexpected reordered queue: %+v", public)
+	}
+	if activeID != "two" || public[2].ID != "two" || !public[2].Active {
+		t.Fatalf("reorder must preserve manually active account: active=%s public=%+v", activeID, public)
 	}
 	reloaded, err := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
 	if err != nil {
@@ -68,5 +74,8 @@ func TestAccountStoreReorderPersistsQueueOrder(t *testing.T) {
 	got := reloaded.Accounts()
 	if got[0].ID != "three" || got[1].ID != "one" || got[2].ID != "two" {
 		t.Fatalf("reordered queue was not persisted: %+v", got)
+	}
+	if reloaded.Active().ID != "two" {
+		t.Fatalf("active account did not survive reorder reload: %+v", reloaded.Active())
 	}
 }

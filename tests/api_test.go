@@ -311,15 +311,28 @@ func TestAPIStateReorderAndLogs(t *testing.T) {
 	httpServer := httptest.NewServer(server.Handler())
 	defer httpServer.Close()
 
+	activate, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/api/admin/accounts/two/activate", nil)
+	response, err := http.DefaultClient.Do(activate)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("manual activation failed: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+	if active := accountStore.Active(); active == nil || active.ID != "two" {
+		t.Fatalf("manual activation was not persisted: %+v", active)
+	}
+
 	reorder, _ := http.NewRequest(http.MethodPut, httpServer.URL+"/api/admin/accounts/order", strings.NewReader(`{"accountIds":["two","one"]}`))
 	reorder.Header.Set("Content-Type", "application/json")
-	response, err := http.DefaultClient.Do(reorder)
+	response, err = http.DefaultClient.Do(reorder)
 	if err != nil || response.StatusCode != http.StatusOK {
 		t.Fatalf("reorder failed: %v status=%v", err, response.StatusCode)
 	}
 	response.Body.Close()
 	if accountStore.Accounts()[0].ID != "two" {
 		t.Fatalf("account order was not updated: %+v", accountStore.Accounts())
+	}
+	if active := accountStore.Active(); active == nil || active.ID != "two" {
+		t.Fatalf("reorder changed active account unexpectedly: %+v", active)
 	}
 
 	stop, _ := http.NewRequest(http.MethodPatch, httpServer.URL+"/api/admin/settings", strings.NewReader(`{"apiEnabled":false}`))
