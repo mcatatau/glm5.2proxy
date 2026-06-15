@@ -47,7 +47,11 @@ type Config struct {
 
 func Load() Config {
 	home, _ := os.UserHomeDir()
-	dataDir := env("ZCODE_PROXY_DATA_DIR", filepath.Join(home, ".glm5.2proxy"))
+	defaultDataDir := filepath.Join(home, ".glm5.2proxy")
+	dataDir := env("ZCODE_PROXY_DATA_DIR", defaultDataDir)
+	if os.Getenv("ZCODE_PROXY_DATA_DIR") == "" && os.Getenv("ZCODE_PROXY_CREDENTIALS_PATH") == "" {
+		migrateLegacyDataDir(home, dataDir)
+	}
 	return Config{
 		Host:                   env("ZCODE_PROXY_HOST", "127.0.0.1"),
 		DefaultPort:            envInt("PORT", envInt("ZCODE_PROXY_PORT", 3005)),
@@ -84,6 +88,44 @@ func Load() Config {
 		DefaultThinkingBudget:  envInt("ZCODE_THINKING_BUDGET", 32000),
 		DefaultEffort:          env("ZCODE_EFFORT", "max"),
 	}
+}
+
+func migrateLegacyDataDir(home, dataDir string) {
+	if home == "" || dataDir == "" {
+		return
+	}
+	legacyDir := filepath.Join(home, ".kimiproxyplus")
+	if samePath(legacyDir, dataDir) {
+		return
+	}
+	copyIfMissing(filepath.Join(legacyDir, "zcode-accounts.enc.json"), filepath.Join(dataDir, "zcode-accounts.enc.json"), 0o600)
+	copyIfMissing(filepath.Join(legacyDir, "admin.json"), filepath.Join(dataDir, "admin.json"), 0o600)
+}
+
+func copyIfMissing(src, dst string, mode os.FileMode) {
+	if _, err := os.Stat(dst); err == nil {
+		return
+	}
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return
+	}
+	_ = os.WriteFile(dst, raw, mode)
+}
+
+func samePath(left, right string) bool {
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	if leftErr == nil {
+		left = leftAbs
+	}
+	if rightErr == nil {
+		right = rightAbs
+	}
+	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 }
 
 func env(key, fallback string) string {

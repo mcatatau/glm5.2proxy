@@ -283,24 +283,31 @@ func (s *Store) load() error {
 		return err
 	}
 	plaintext, err := s.decrypt(envelope)
+	needsResave := false
 	if err != nil {
-		return fmt.Errorf("could not decrypt credential store %q: %w", s.path, err)
+		if s.secret != "" {
+			return fmt.Errorf("could not decrypt credential store %q: %w", s.path, err)
+		}
+		plaintext, err = s.decryptWithKey(envelope, defaultKey("kimiproxyplus"))
+		if err != nil {
+			return fmt.Errorf("could not decrypt credential store %q: %w", s.path, err)
+		}
+		needsResave = true
 	}
 	if err := json.Unmarshal(plaintext, &s.data); err != nil {
 		return err
 	}
 	next := 0
-	migrated := false
 	for index := range s.data.Accounts {
 		if s.data.Accounts[index].RegistrationOrder == 0 {
 			next++
 			s.data.Accounts[index].RegistrationOrder = next
-			migrated = true
+			needsResave = true
 		} else if s.data.Accounts[index].RegistrationOrder > next {
 			next = s.data.Accounts[index].RegistrationOrder
 		}
 	}
-	if migrated {
+	if needsResave {
 		return s.saveLocked()
 	}
 	return nil
@@ -348,6 +355,10 @@ func (s *Store) encrypt(plaintext []byte) (envelope, error) {
 }
 
 func (s *Store) decrypt(value envelope) ([]byte, error) {
+	return s.decryptWithKey(value, s.key())
+}
+
+func (s *Store) decryptWithKey(value envelope, key []byte) ([]byte, error) {
 	iv, err := base64.StdEncoding.DecodeString(value.IV)
 	if err != nil {
 		return nil, err
@@ -360,7 +371,7 @@ func (s *Store) decrypt(value envelope) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	block, err := aes.NewCipher(s.key())
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
@@ -372,20 +383,25 @@ func (s *Store) decrypt(value envelope) ([]byte, error) {
 }
 
 func (s *Store) key() []byte {
-	secret := s.secret
-	if secret == "" {
-		host, _ := os.Hostname()
-		current, _ := user.Current()
-		home, _ := os.UserHomeDir()
-		username := ""
-		if current != nil {
-			username = current.Username
-			if separator := strings.LastIndexAny(username, `\/`); separator >= 0 {
-				username = username[separator+1:]
-			}
-		}
-		secret = fmt.Sprintf("glm5.2proxy:%s:%s:%s", host, username, home)
+	if s.secret != "" {
+		sum := sha256.Sum256([]byte(s.secret))
+		return sum[:]
 	}
+	return defaultKey("glm5.2proxy")
+}
+
+func defaultKey(namespace string) []byte {
+	host, _ := os.Hostname()
+	current, _ := user.Current()
+	home, _ := os.UserHomeDir()
+	username := ""
+	if current != nil {
+		username = current.Username
+		if separator := strings.LastIndexAny(username, `\/`); separator >= 0 {
+			username = username[separator+1:]
+		}
+	}
+	secret := fmt.Sprintf("%s:%s:%s:%s", namespace, host, username, home)
 	sum := sha256.Sum256([]byte(secret))
 	return sum[:]
 }

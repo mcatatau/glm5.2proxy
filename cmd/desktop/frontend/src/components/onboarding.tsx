@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils'
 const slides = [
   {
     title: 'Bem-vindo ao glm5.2proxy',
-    description: 'Seu proxy inteligente para gerenciar mÃºltiplas contas ZCode com rotaÃ§Ã£o automÃ¡tica e controle total.',
+    description: 'Seu proxy inteligente para gerenciar múltiplas contas ZCode com rotação automática e controle total.',
     icon: (
       <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" className="text-primary">
         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" />
@@ -15,8 +15,8 @@ const slides = [
     ),
   },
   {
-    title: 'GestÃ£o Inteligente de Contas',
-    description: 'Adicione mÃºltiplas contas, monitore cotas em tempo real e deixe o sistema alternar automaticamente quando necessÃ¡rio.',
+    title: 'Gestão Inteligente de Contas',
+    description: 'Adicione múltiplas contas, monitore cotas em tempo real e deixe o sistema alternar automaticamente quando necessário.',
     icon: (
       <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" className="text-primary">
         <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
@@ -27,8 +27,8 @@ const slides = [
     ),
   },
   {
-    title: 'CompatÃ­vel com OpenAI',
-    description: 'API drop-in compatÃ­vel com clientes OpenAI. Basta apontar para a porta do proxy e usar sua chave.',
+    title: 'Compatível com OpenAI',
+    description: 'API drop-in compatível com clientes OpenAI. Basta apontar para a porta do proxy e usar sua chave.',
     icon: (
       <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" className="text-primary">
         <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z" />
@@ -179,7 +179,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
                 'shadow-lg shadow-foreground/10'
               )}
             >
-              ComeÃ§ar
+              Começar
               <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14" /><path d="m12 5 7 7-7 7" /></svg>
             </button>
           ) : (
@@ -203,7 +203,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
           onClick={handleFinish}
           className="mt-6 text-xs text-muted-foreground/50 transition-colors hover:text-muted-foreground"
         >
-          Pular introduÃ§Ã£o
+          Pular introdução
         </button>
       </div>
     </div>

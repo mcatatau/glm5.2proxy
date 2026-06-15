@@ -202,7 +202,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		s.logs.add("info", "queue.released", fmt.Sprintf("Request %s liberado apos aguardar fila %s", requestID, queueKey))
 	}
 	onSuccess := func() {
-		s.logs.add("info", "chat.completed", fmt.Sprintf("Request %s concluÃ­do com %s", requestID, model.ID))
+		s.logs.add("info", "chat.completed", fmt.Sprintf("Request %s concluído com %s", requestID, model.ID))
 		if s.cfg.QuotaLog {
 			go s.logQuota(requestID, selection.Config, model, before)
 		}
@@ -213,7 +213,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	completion, attempts, err := s.proxy.Collect(r.Context(), selection.Config, upstreamBody)
 	if err != nil {
-		s.logs.add("error", "chat.failed", fmt.Sprintf("Request %s falhou apÃ³s %d tentativa(s): %v", requestID, attempts, err))
+		s.logs.add("error", "chat.failed", fmt.Sprintf("Request %s falhou após %d tentativa(s): %v", requestID, attempts, err))
 		writeProxyError(w, err, attempts)
 		return
 	}
@@ -378,7 +378,7 @@ func (s *Server) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result["status"] == "ready" {
-		s.logs.add("info", "auth.completed", "Conta ZCode autenticada e adicionada Ã  fila")
+		s.logs.add("info", "auth.completed", "Conta ZCode autenticada e adicionada à fila")
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -620,7 +620,7 @@ func (s *Server) logQuota(requestID string, upstreamConfig upstream.Config, mode
 	}
 	log.Printf("[quota] request=%s model=%s antiga used=%s remaining=%s available=%s -> atualizada used=%s remaining=%s available=%s deltaUsed=%s", requestID, model.UpstreamID, pointer(before, func(v *quota.Balance) *int64 { return v.Used }), pointer(before, func(v *quota.Balance) *int64 { return v.Remaining }), pointer(before, func(v *quota.Balance) *int64 { return v.Available }), pointer(after, func(v *quota.Balance) *int64 { return v.Used }), pointer(after, func(v *quota.Balance) *int64 { return v.Remaining }), pointer(after, func(v *quota.Balance) *int64 { return v.Available }), delta(before, after))
 	s.logs.add("info", "quota.updated", fmt.Sprintf(
-		"Request %s Â· %s Â· cota antiga %s usados/%s disponÃ­veis â†’ cota nova %s usados/%s disponÃ­veis Â· delta %s",
+		"Request %s · %s · cota antiga %s usados/%s disponíveis → cota nova %s usados/%s disponíveis · delta %s",
 		requestID,
 		model.UpstreamID,
 		pointer(before, func(v *quota.Balance) *int64 { return v.Used }),

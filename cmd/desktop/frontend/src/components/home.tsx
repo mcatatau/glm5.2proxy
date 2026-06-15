@@ -101,8 +101,8 @@ export function Home() {
                   <p className="text-sm font-semibold">{settings.apiEnabled ? 'API OpenAI ativa' : 'API OpenAI parada'}</p>
                   <p className="text-xs text-muted-foreground">
                     {settings.apiEnabled
-                      ? `${settings.apiKeys.length || 'Nenhuma'} chave configurada Â· /v1/chat/completions disponÃ­vel`
-                      : 'O painel continua funcionando; clientes /v1 recebem API indisponÃ­vel'}
+                      ? `${settings.apiKeys.length || 'Nenhuma'} chave configurada · /v1/chat/completions disponível`
+                      : 'O painel continua funcionando; clientes /v1 recebem API indisponível'}
                   </p>
                 </div>
               </div>
@@ -120,7 +120,7 @@ export function Home() {
               <div>
                 <h1 className="text-2xl font-semibold">Fila de contas</h1>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  {loading ? 'Consultando contas e cotas...' : `${accounts.length} conta${accounts.length === 1 ? '' : 's'} Â· arraste pelo puxador para reordenar`}
+                  {loading ? 'Consultando contas e cotas...' : `${accounts.length} conta${accounts.length === 1 ? '' : 's'} · arraste pelo puxador para reordenar`}
                 </p>
               </div>
               <div className="flex gap-2">
