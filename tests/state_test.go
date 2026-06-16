@@ -26,7 +26,10 @@ func TestAdminSettingsThinkingAndAPIKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !store.ValidateAPIKey("Bearer "+secret) || store.ValidateAPIKey("wrong") {
+	if !store.ValidateAPIKey("Bearer "+secret) ||
+		!store.ValidateAPIKey("bearer   "+secret) ||
+		!store.ValidateAPIKey(secret) ||
+		store.ValidateAPIKey("wrong") {
 		t.Fatal("API key validation failed")
 	}
 	public := store.PublicSnapshot()

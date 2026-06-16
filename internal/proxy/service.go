@@ -490,6 +490,23 @@ func IsAdmissionConcurrency(err error) bool {
 		strings.Contains(text, "model concurrency limit exceeded")
 }
 
+func IsParameterError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var upstreamError *UpstreamError
+	if !errors.As(err, &upstreamError) {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{
+		upstreamError.Message,
+		upstreamError.Type,
+		fmt.Sprint(upstreamError.Code),
+	}, " "))
+	return upstreamError.Status == http.StatusBadRequest &&
+		(strings.Contains(text, "parameter error") || strings.Contains(text, "3001"))
+}
+
 func IsQuotaExhausted(err error) bool {
 	var upstreamError *UpstreamError
 	if !errors.As(err, &upstreamError) {

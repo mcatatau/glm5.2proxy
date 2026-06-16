@@ -187,7 +187,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !selection.Config.HasAuthorization {
-			writeError(w, http.StatusInternalServerError, "missing ZCode Authorization", "zcode_auth_missing")
+			writeError(w, http.StatusUnauthorized, "Nenhuma conta Z.ai/ZCode esta conectada. Abra o app, adicione uma conta e tente novamente.", "zcode_auth_missing")
 			return
 		}
 		accountID := ""
@@ -227,8 +227,8 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				authSkipped = true
 				continue
 			}
-			s.logs.add("error", "chat.failed", fmt.Sprintf("Streaming falhou apos %d tentativa(s): %v", attempts, err))
-			writeProxyError(w, err, attempts)
+			diagnostic := s.logChatFailure(requestID, attempts, err, body, upstreamBody)
+			writeProxyErrorWithDiagnostic(w, err, attempts, diagnostic)
 			return
 		}
 		completion, attempts, err := s.proxy.Collect(r.Context(), selection.Config, upstreamBody)
@@ -241,8 +241,8 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				authSkipped = true
 				continue
 			}
-			s.logs.add("error", "chat.failed", fmt.Sprintf("Request %s falhou apos %d tentativa(s): %v", requestID, attempts, err))
-			writeProxyError(w, err, attempts)
+			diagnostic := s.logChatFailure(requestID, attempts, err, body, upstreamBody)
+			writeProxyErrorWithDiagnostic(w, err, attempts, diagnostic)
 			return
 		}
 		message := map[string]any{"role": "assistant", "content": completion.Text}
@@ -322,6 +322,136 @@ func (s *Server) skipAuthFailedAccount(requestID, accountID string, err error, s
 	skipped[accountID] = true
 	s.logs.add("warn", "account.auth_failed", fmt.Sprintf("Request %s recebeu erro de login na conta %s; tentando proxima conta salva", requestID, accountID))
 	return true
+}
+
+func (s *Server) logChatFailure(requestID string, attempts int, err error, clientBody, upstreamBody map[string]any) map[string]any {
+	if captchaErr, ok := captcha.Classify(err); ok {
+		event, message := s.captchaLogMessage(requestID, attempts, captchaErr)
+		s.logs.add("warn", event, message)
+		return nil
+	}
+	if proxy.IsParameterError(err) {
+		diagnostic := sanitizedPayloadDiagnostic(clientBody, upstreamBody)
+		raw, _ := json.Marshal(diagnostic)
+		s.logs.add("error", "upstream.parameter_error", fmt.Sprintf("Request %s falhou: a Z.ai recusou algum parametro do payload traduzido. Diagnostico sanitizado: %s", requestID, string(raw)))
+		return diagnostic
+	}
+	s.logs.add("error", "chat.failed", fmt.Sprintf("Request %s falhou apos %d tentativa(s): %v", requestID, attempts, err))
+	return nil
+}
+
+func (s *Server) captchaLogMessage(requestID string, attempts int, err *captcha.Error) (string, string) {
+	captchaURL := fmt.Sprintf("http://127.0.0.1:%d/zcode/captcha/browser?client=standalone-browser", s.port)
+	switch err.Kind {
+	case captcha.ErrDisabled:
+		return "captcha.disabled", fmt.Sprintf("Request %s falhou: a Z.ai pediu captcha, mas o captcha bridge esta desativado. Ative o captcha bridge ou configure ZCODE_CAPTCHA_BRIDGE=true.", requestID)
+	case captcha.ErrBrowserUnavailable:
+		snapshot := s.browser.Snapshot()
+		lastError := browserLastError(snapshot)
+		if strings.Contains(strings.ToLower(lastError), "no supported chrome or edge") {
+			return "captcha.browser_missing", fmt.Sprintf("Request %s falhou: a Z.ai pediu captcha, mas nao encontrei Chrome nem Edge instalado para abrir o navegador captcha automatico. Instale Chrome/Edge ou abra manualmente %s.", requestID, captchaURL)
+		}
+		if !snapshot.Enabled {
+			return "captcha.browser_disabled", fmt.Sprintf("Request %s falhou: a Z.ai pediu captcha, mas o navegador captcha automatico esta desativado. Abra manualmente %s.", requestID, captchaURL)
+		}
+		if lastError != "" {
+			return "captcha.browser_unavailable", fmt.Sprintf("Request %s falhou: a Z.ai pediu captcha, mas o navegador captcha nao ficou disponivel. Ultimo erro do browser: %s. Abra manualmente %s.", requestID, lastError, captchaURL)
+		}
+		return "captcha.browser_unavailable", fmt.Sprintf("Request %s falhou: a Z.ai pediu captcha, mas nenhum navegador captcha esta conectado ao proxy. Abra %s e tente novamente.", requestID, captchaURL)
+	case captcha.ErrInteractiveRequired:
+		return "captcha.interactive_required", fmt.Sprintf("Request %s falhou: a Z.ai pediu captcha interativo. Abra %s, resolva a verificacao e tente novamente.", requestID, captchaURL)
+	case captcha.ErrTimeout:
+		return "captcha.timeout", fmt.Sprintf("Request %s falhou apos %d tentativa(s): a Z.ai pediu captcha, mas o navegador captcha nao respondeu dentro do tempo limite. Abra %s e tente novamente.", requestID, attempts, captchaURL)
+	case captcha.ErrEmptyToken:
+		return "captcha.empty_token", fmt.Sprintf("Request %s falhou: o navegador captcha respondeu sem token valido. Abra %s, resolva a verificacao e tente novamente.", requestID, captchaURL)
+	default:
+		return "captcha.failed", fmt.Sprintf("Request %s falhou por captcha: %s. Abra %s e tente novamente.", requestID, err.Message, captchaURL)
+	}
+}
+
+func browserLastError(snapshot captcha.BrowserSnapshot) string {
+	if snapshot.LastExit == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(snapshot.LastExit["error"]))
+}
+
+func sanitizedPayloadDiagnostic(clientBody, upstreamBody map[string]any) map[string]any {
+	return map[string]any{
+		"client_request":   sanitizeDiagnosticValue("", clientBody, 0),
+		"translated_body":  sanitizeDiagnosticValue("", upstreamBody, 0),
+		"sanitization":     "text fields are summarized by length; credentials/captcha values are redacted",
+		"probable_problem": "check unsupported top-level params, message content shape, thinking/max_tokens, tools and tool_choice",
+	}
+}
+
+func sanitizeDiagnosticValue(key string, value any, depth int) any {
+	if depth > 6 {
+		return "<max_depth>"
+	}
+	key = strings.ToLower(key)
+	if sensitiveDiagnosticKey(key) {
+		if strings.TrimSpace(fmt.Sprint(value)) == "" {
+			return ""
+		}
+		return "<redacted>"
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for childKey, childValue := range typed {
+			out[childKey] = sanitizeDiagnosticValue(childKey, childValue, depth+1)
+		}
+		return out
+	case []any:
+		limit := len(typed)
+		if limit > 12 {
+			limit = 12
+		}
+		out := make([]any, 0, limit+1)
+		for index := 0; index < limit; index++ {
+			out = append(out, sanitizeDiagnosticValue(key, typed[index], depth+1))
+		}
+		if len(typed) > limit {
+			out = append(out, map[string]any{"omitted_items": len(typed) - limit})
+		}
+		return out
+	case string:
+		if textDiagnosticKey(key) {
+			return map[string]any{"type": "string", "length": len(typed)}
+		}
+		return truncateString(typed, 180)
+	default:
+		return typed
+	}
+}
+
+func sensitiveDiagnosticKey(key string) bool {
+	for _, marker := range []string{"authorization", "token", "secret", "password", "api_key", "apikey", "captcha", "cookie"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func textDiagnosticKey(key string) bool {
+	switch key {
+	case "content", "text", "system", "thinking", "partial_json", "arguments":
+		return true
+	default:
+		return false
+	}
+}
+
+func truncateString(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	if limit <= 12 {
+		return value[:limit]
+	}
+	return value[:limit-12] + "...<truncated>"
 }
 
 func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
@@ -719,16 +849,31 @@ func writeError(w http.ResponseWriter, status int, message, kind string) {
 }
 
 func writeProxyError(w http.ResponseWriter, err error, attempts int) {
+	writeProxyErrorWithDiagnostic(w, err, attempts, nil)
+}
+
+func writeProxyErrorWithDiagnostic(w http.ResponseWriter, err error, attempts int, diagnostic map[string]any) {
 	status := http.StatusBadGateway
 	if value, ok := err.(*proxy.UpstreamError); ok && value.Status >= 400 {
 		status = value.Status
 	}
 	payload := errorPayload(err)
 	payload["attempts"] = attempts
+	if diagnostic != nil {
+		payload["request_diagnostic"] = diagnostic
+	}
 	writeJSON(w, status, map[string]any{"error": payload})
 }
 
 func errorPayload(err error) map[string]any {
+	if captchaErr, ok := captcha.Classify(err); ok {
+		message := friendlyCaptchaErrorMessage(captchaErr)
+		payload := map[string]any{"message": message, "type": "zcode_" + captchaErr.Kind}
+		if captchaErr.Message != "" && captchaErr.Message != message {
+			payload["technical_message"] = captchaErr.Message
+		}
+		return payload
+	}
 	if value, ok := err.(*proxy.UpstreamError); ok {
 		message := friendlyErrorMessage(value)
 		payload := map[string]any{"message": message, "type": value.Type, "code": value.Code, "request_id": value.RequestID, "status": value.Status}
@@ -738,6 +883,23 @@ func errorPayload(err error) map[string]any {
 		return payload
 	}
 	return map[string]any{"message": err.Error(), "type": "upstream_error"}
+}
+
+func friendlyCaptchaErrorMessage(err *captcha.Error) string {
+	switch err.Kind {
+	case captcha.ErrDisabled:
+		return "A Z.ai pediu captcha, mas o captcha bridge esta desativado no proxy."
+	case captcha.ErrBrowserUnavailable:
+		return "A Z.ai pediu captcha, mas nenhum navegador captcha esta disponivel. Abra /zcode/captcha/browser e tente novamente."
+	case captcha.ErrInteractiveRequired:
+		return "A Z.ai pediu captcha interativo. Abra /zcode/captcha/browser, resolva a verificacao e tente novamente."
+	case captcha.ErrTimeout:
+		return "A Z.ai pediu captcha, mas o navegador captcha demorou demais para responder. Abra /zcode/captcha/browser e tente novamente."
+	case captcha.ErrEmptyToken:
+		return "A Z.ai pediu captcha, mas o navegador retornou uma verificacao vazia. Abra /zcode/captcha/browser e tente novamente."
+	default:
+		return "A Z.ai pediu captcha. Abra /zcode/captcha/browser, resolva a verificacao e tente novamente."
+	}
 }
 
 func friendlyErrorMessage(err *proxy.UpstreamError) string {

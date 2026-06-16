@@ -67,6 +67,144 @@ func TestAdministrativeAPIAndAPIKeyProtection(t *testing.T) {
 	authorized.Body.Close()
 }
 
+func TestChatWithoutZCodeAccountReturnsFriendlyAuthError(t *testing.T) {
+	cfg := testConfig(t)
+	admin, _ := state.NewAdminStore(cfg.AdminPath, 3005, state.ThinkingSettings{Enabled: true, BudgetTokens: 32000, Effort: "max"})
+	accountStore, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	loader := upstream.NewLoader(cfg, accountStore)
+	quotaService := quota.New(cfg)
+	bridge := captcha.NewBridge(cfg)
+	browser := captcha.NewBrowserManager(cfg, 3005)
+	server := api.New(cfg, 3005, admin, accountStore, auth.New(cfg, accountStore), quotaService, accountpool.New(cfg, accountStore, loader, quotaService), loader, bridge, browser, proxy.New(cfg, bridge))
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"oi"}],"stream":false}`)
+	response, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusUnauthorized || payload["error"]["type"] != "zcode_auth_missing" {
+		t.Fatalf("expected friendly auth error, status=%d payload=%+v", response.StatusCode, payload)
+	}
+}
+
+func TestCaptchaBrowserUnavailableIsLoggedWithActionableEvent(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Authorization = "Bearer test-token"
+	cfg.CaptchaEnabled = true
+	cfg.HeadlessEnabled = false
+	admin, _ := state.NewAdminStore(cfg.AdminPath, 3005, state.ThinkingSettings{Enabled: true, BudgetTokens: 32000, Effort: "max"})
+	accountStore, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	loader := upstream.NewLoader(cfg, accountStore)
+	quotaService := quota.New(cfg)
+	bridge := captcha.NewBridge(cfg)
+	browser := captcha.NewBrowserManager(cfg, 3005)
+	server := api.New(cfg, 3005, admin, accountStore, auth.New(cfg, accountStore), quotaService, accountpool.New(cfg, accountStore, loader, quotaService), loader, bridge, browser, proxy.New(cfg, bridge))
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"oi"}],"stream":false}`)
+	response, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway || payload["error"]["type"] != "zcode_captcha_browser_unavailable" {
+		t.Fatalf("expected captcha browser error, status=%d payload=%+v", response.StatusCode, payload)
+	}
+
+	logsResponse, err := http.Get(httpServer.URL + "/api/admin/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs map[string]any
+	if err := json.NewDecoder(logsResponse.Body).Decode(&logs); err != nil {
+		t.Fatal(err)
+	}
+	logsResponse.Body.Close()
+	entries := logs["data"].([]any)
+	if len(entries) == 0 {
+		t.Fatal("expected captcha log entry")
+	}
+	last := entries[len(entries)-1].(map[string]any)
+	if last["event"] != "captcha.browser_disabled" || !strings.Contains(last["message"].(string), "/zcode/captcha/browser") {
+		t.Fatalf("unexpected captcha log: %+v", last)
+	}
+}
+
+func TestParameterErrorLogsSanitizedPayloadDiagnostic(t *testing.T) {
+	fakeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/messages":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"code":"3001","message":"parameter error","type":"zcode_upstream_error"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fakeUpstream.Close()
+
+	cfg := testConfig(t)
+	cfg.Authorization = "Bearer test-token"
+	cfg.UpstreamURL = fakeUpstream.URL + "/messages"
+	admin, _ := state.NewAdminStore(cfg.AdminPath, 3005, state.ThinkingSettings{Enabled: true, BudgetTokens: 32000, Effort: "max"})
+	accountStore, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	loader := upstream.NewLoader(cfg, accountStore)
+	quotaService := quota.New(cfg)
+	bridge := captcha.NewBridge(cfg)
+	browser := captcha.NewBrowserManager(cfg, 3005)
+	server := api.New(cfg, 3005, admin, accountStore, auth.New(cfg, accountStore), quotaService, accountpool.New(cfg, accountStore, loader, quotaService), loader, bridge, browser, proxy.New(cfg, bridge))
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"texto muito secreto do usuario"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"stream":false}`)
+	response, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var errorPayload map[string]map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&errorPayload); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected upstream parameter status, got %d", response.StatusCode)
+	}
+	if _, ok := errorPayload["error"]["request_diagnostic"].(map[string]any); !ok {
+		t.Fatalf("expected request diagnostic in response: %+v", errorPayload)
+	}
+
+	logsResponse, err := http.Get(httpServer.URL + "/api/admin/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs map[string]any
+	if err := json.NewDecoder(logsResponse.Body).Decode(&logs); err != nil {
+		t.Fatal(err)
+	}
+	logsResponse.Body.Close()
+	entries := logs["data"].([]any)
+	last := entries[len(entries)-1].(map[string]any)
+	message := last["message"].(string)
+	if last["event"] != "upstream.parameter_error" ||
+		!strings.Contains(message, "translated_body") ||
+		!strings.Contains(message, "tool_choice") ||
+		strings.Contains(message, "texto muito secreto do usuario") {
+		t.Fatalf("unexpected parameter diagnostic log: %+v", last)
+	}
+}
+
 func TestChatRequestsAreQueuedPerDefaultAccountAndModel(t *testing.T) {
 	var active int32
 	var maxActive int32

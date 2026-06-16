@@ -46,11 +46,11 @@ func NewBridge(cfg config.Config) *Bridge {
 
 func (b *Bridge) Fresh(ctx context.Context) (string, error) {
 	if !b.cfg.CaptchaEnabled {
-		return "", errors.New("captcha bridge is disabled")
+		return "", NewError(ErrDisabled, "captcha bridge is disabled")
 	}
 	client := b.chooseClient()
 	if client == nil {
-		return "", errors.New("fresh captcha browser is unavailable")
+		return "", NewError(ErrBrowserUnavailable, "fresh captcha browser is unavailable")
 	}
 	id := randomID()
 	waiter := make(chan result, 1)
@@ -71,7 +71,7 @@ func (b *Bridge) Fresh(ctx context.Context) (string, error) {
 		return value.token, value.err
 	case <-timer.C:
 		b.deleteWaiter(id)
-		return "", errors.New("timed out waiting for captcha browser")
+		return "", NewError(ErrTimeout, "timed out waiting for captcha browser")
 	case <-ctx.Done():
 		b.deleteWaiter(id)
 		return "", ctx.Err()
@@ -118,13 +118,20 @@ func (b *Bridge) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Error != "" {
-		waiter <- result{err: errors.New(body.Error)}
+		waiter <- result{err: classifySubmitError(body.Error)}
 	} else if strings.TrimSpace(body.Token) == "" {
-		waiter <- result{err: errors.New("captcha browser returned an empty token")}
+		waiter <- result{err: NewError(ErrEmptyToken, "captcha browser returned an empty token")}
 	} else {
 		waiter <- result{token: strings.TrimSpace(body.Token)}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func classifySubmitError(message string) error {
+	if classified, ok := Classify(errors.New(message)); ok {
+		return classified
+	}
+	return errors.New(message)
 }
 
 func (b *Bridge) Test(w http.ResponseWriter, r *http.Request) {

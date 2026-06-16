@@ -185,13 +185,22 @@ func (s *AdminStore) ValidateAPIKey(secret string) bool {
 	if len(s.data.APIKeys) == 0 {
 		return true
 	}
-	value := hash(strings.TrimSpace(strings.TrimPrefix(secret, "Bearer ")))
+	value := hash(apiKeySecret(secret))
 	for _, key := range s.data.APIKeys {
 		if key.Hash == value {
 			return true
 		}
 	}
 	return false
+}
+
+func apiKeySecret(header string) string {
+	value := strings.TrimSpace(header)
+	fields := strings.Fields(value)
+	if len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") {
+		return fields[1]
+	}
+	return value
 }
 
 func (s *AdminStore) saveLocked() error {
