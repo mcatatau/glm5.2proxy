@@ -106,3 +106,40 @@ func TestAccountPoolRotatesBeforeChatWhenActiveQuotaIsExhausted(t *testing.T) {
 		t.Fatalf("unexpected quota check order: %+v", checkedTokens)
 	}
 }
+
+func TestAccountPoolRotatesWhenAvailableIsBelowRequestReserve(t *testing.T) {
+	var checkedTokens []string
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/billing/balance" {
+			http.NotFound(w, r)
+			return
+		}
+		token := r.Header.Get("Authorization")
+		checkedTokens = append(checkedTokens, token)
+		available := 56125
+		if token == "Bearer fresh-token" {
+			available = 3000000
+		}
+		json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"balances": []any{map[string]any{"show_name": "GLM-5.2", "total_units": 3000000, "used_units": 3000000 - available, "remaining_units": available, "available_units": available}}}})
+	}))
+	defer mock.Close()
+
+	cfg := testConfig(t)
+	cfg.BillingBaseURL = mock.URL + "/billing"
+	cfg.AccountMinAvailable = 96000
+	store, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	_, _ = store.Upsert(accounts.User{UserID: "low"}, "low-token", "")
+	_, _ = store.Upsert(accounts.User{UserID: "fresh"}, "fresh-token", "")
+
+	loader := upstream.NewLoader(cfg, store)
+	pool := accountpool.New(cfg, store, loader, quota.New(cfg))
+	model, _ := models.Resolve("glm-5.2")
+	selection := pool.Select(context.Background(), model)
+	if selection.Account == nil || selection.Account.User.UserID != "fresh" || !selection.Rotated {
+		t.Fatalf("expected low-reserve account to rotate to fresh account: %+v", selection)
+	}
+	if len(checkedTokens) != 2 || checkedTokens[0] != "Bearer low-token" || checkedTokens[1] != "Bearer fresh-token" {
+		t.Fatalf("unexpected quota check order: %+v", checkedTokens)
+	}
+}

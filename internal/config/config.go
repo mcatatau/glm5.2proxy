@@ -52,6 +52,13 @@ func Load() Config {
 	if os.Getenv("ZCODE_PROXY_DATA_DIR") == "" && os.Getenv("ZCODE_PROXY_CREDENTIALS_PATH") == "" {
 		migrateLegacyDataDir(home, dataDir)
 	}
+	defaultMaxTokens := envInt("ZCODE_MAX_TOKENS", 64000)
+	defaultThinkingEnabled := enabled("ZCODE_THINKING", true)
+	defaultThinkingBudget := envInt("ZCODE_THINKING_BUDGET", 32000)
+	defaultMinAvailable := defaultMaxTokens
+	if defaultThinkingEnabled {
+		defaultMinAvailable += defaultThinkingBudget
+	}
 	return Config{
 		Host:                   env("ZCODE_PROXY_HOST", "127.0.0.1"),
 		DefaultPort:            envInt("PORT", envInt("ZCODE_PROXY_PORT", 3005)),
@@ -79,13 +86,13 @@ func Load() Config {
 		RetryBaseDelay:         envDurationMS("ZCODE_RETRY_BASE_DELAY_MS", 1000),
 		RetryMaxDelay:          envDurationMS("ZCODE_RETRY_MAX_DELAY_MS", 60000),
 		AccountRotation:        enabled("ZCODE_ACCOUNT_ROTATION", true),
-		AccountMinAvailable:    int64(envInt("ZCODE_ACCOUNT_MIN_AVAILABLE_UNITS", 1)),
+		AccountMinAvailable:    int64(envInt("ZCODE_ACCOUNT_MIN_AVAILABLE_UNITS", defaultMinAvailable)),
 		QuotaLog:               enabled("ZCODE_QUOTA_LOG", true),
 		QuotaRefreshDelay:      envDurationMS("ZCODE_QUOTA_REFRESH_DELAY_MS", 1500),
 		QuotaRefreshAttempts:   envInt("ZCODE_QUOTA_REFRESH_ATTEMPTS", 3),
-		DefaultMaxTokens:       envInt("ZCODE_MAX_TOKENS", 64000),
-		DefaultThinkingEnabled: enabled("ZCODE_THINKING", true),
-		DefaultThinkingBudget:  envInt("ZCODE_THINKING_BUDGET", 32000),
+		DefaultMaxTokens:       defaultMaxTokens,
+		DefaultThinkingEnabled: defaultThinkingEnabled,
+		DefaultThinkingBudget:  defaultThinkingBudget,
 		DefaultEffort:          env("ZCODE_EFFORT", "max"),
 	}
 }
