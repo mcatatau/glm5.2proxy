@@ -42,6 +42,7 @@ type Server struct {
 	http     *http.Server
 	logs     *logBuffer
 	reserve  *usageReserve
+	zcode    *zcodeBridge
 }
 
 func New(
@@ -57,7 +58,7 @@ func New(
 	browser *captcha.BrowserManager,
 	proxyService *proxy.Service,
 ) *Server {
-	server := &Server{cfg: cfg, port: port, admin: admin, accounts: accountStore, oauth: oauth, quota: quotaService, pool: pool, loader: loader, captcha: bridge, browser: browser, proxy: proxyService, queue: requestqueue.New(), logs: newLogBuffer(500), reserve: newUsageReserve(cfg)}
+	server := &Server{cfg: cfg, port: port, admin: admin, accounts: accountStore, oauth: oauth, quota: quotaService, pool: pool, loader: loader, captcha: bridge, browser: browser, proxy: proxyService, queue: requestqueue.New(), logs: newLogBuffer(500), reserve: newUsageReserve(cfg), zcode: newZCodeBridge()}
 	server.http = &http.Server{Addr: net.JoinHostPort(cfg.Host, strconv.Itoa(port)), Handler: server.routes(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
 	return server
 }
@@ -132,6 +133,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/admin/accounts", s.listAccounts)
 	mux.HandleFunc("GET /api/admin/accounts/{id}", s.getAccount)
 	mux.HandleFunc("POST /api/admin/accounts/{id}/activate", s.activateAccountByPath)
+	mux.HandleFunc("GET /api/admin/zcode/environment", s.zcodeEnvironment)
+	mux.HandleFunc("POST /api/admin/zcode/accounts/{id}/activate", s.activateAccountInZCode)
+	mux.HandleFunc("GET /api/admin/zcode/bridge/status", s.zcodeBridgeStatus)
+	mux.HandleFunc("GET /api/admin/zcode/bridge/next", s.zcodeBridgeNext)
+	mux.HandleFunc("POST /api/admin/zcode/bridge/ack", s.zcodeBridgeAck)
 	mux.HandleFunc("PUT /api/admin/accounts/order", s.reorderAccounts)
 	mux.HandleFunc("DELETE /api/admin/accounts/{id}", s.deleteAccountByPath)
 	mux.HandleFunc("POST /api/admin/auth/login/start", s.loginStart)
@@ -196,18 +202,6 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		if selection.Account != nil {
 			accountID = selection.Account.ID
 		}
-		if selection.Rotated && selection.Account != nil {
-			fromLabel := "nenhuma conta anterior"
-			if previousActive != nil {
-				fromLabel = accounts.Sanitize(*previousActive).Label
-			}
-			toLabel := accounts.Sanitize(*selection.Account).Label
-			s.logs.add(
-				"info",
-				"account.rotated",
-				fmt.Sprintf("Request %s trocou automaticamente a conta de %s para %s ao selecionar %s", requestID, fromLabel, toLabel, model.ID),
-			)
-		}
 		requiredUnits := s.reserve.Minimum(model.ID, s.cfg.AccountMinAvailable)
 		if accountID != "" && selection.Balance != nil && selection.Balance.Available != nil && *selection.Balance.Available < requiredUnits {
 			skipped[accountID] = true
@@ -231,6 +225,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				delete(skipped, accountID)
 			}
 		}
+		s.logAndSyncAutoRotation(requestID, previousActive, selection.Account, model)
 		queueKey := requestqueue.Key(accountID, model.ID)
 		thinking := s.admin.ThinkingFor(accountID)
 		upstreamBody := openai.ToAnthropic(body, selection.Config.BodyTemplate, model, thinking, s.cfg.DefaultMaxTokens)
@@ -343,6 +338,35 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, upstreamConf
 	flusher.Flush()
 	onSuccess()
 	return attempts, nil, true
+}
+
+func (s *Server) logAndSyncAutoRotation(requestID string, previousActive *accounts.Account, selected *accounts.Account, model models.Model) {
+	if selected == nil {
+		return
+	}
+	if previousActive != nil && previousActive.ID == selected.ID {
+		return
+	}
+	fromLabel := "nenhuma conta anterior"
+	if previousActive != nil {
+		fromLabel = accounts.Sanitize(*previousActive).Label
+	}
+	toLabel := accounts.Sanitize(*selected).Label
+	s.logs.add(
+		"info",
+		"account.rotated",
+		fmt.Sprintf("Request %s trocou automaticamente a conta de %s para %s ao selecionar %s", requestID, fromLabel, toLabel, model.ID),
+	)
+	go func(accountID, accountLabel string) {
+		result, err := s.applyAccountInZCode(accountID)
+		if err != nil {
+			s.logs.add("warn", "zcode.auto_apply_failed", "Rotacao automatica selecionou "+accountLabel+", mas nao foi possivel aplicar no ZCode: "+err.Error())
+			return
+		}
+		if result != nil {
+			s.logs.add("info", "zcode.auto_applied", "Rotacao automatica aplicou "+accountLabel+" no ambiente interno do ZCode")
+		}
+	}(selected.ID, toLabel)
 }
 
 func (s *Server) skipQuotaExhaustedAccount(requestID, accountID string, model models.Model, err error, skipped map[string]bool) bool {
@@ -638,7 +662,15 @@ func (s *Server) activate(w http.ResponseWriter, id string) {
 		return
 	}
 	s.logs.add("info", "account.activated", "Conta ativa alterada para "+account.Label)
-	writeJSON(w, http.StatusOK, map[string]any{"activeAccount": account})
+	zcodeResult, zcodeErr := s.applyAccountInZCode(account.ID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"activeAccount": account,
+		"zcode": map[string]any{
+			"synced": zcodeErr == nil && zcodeResult != nil,
+			"error":  nullableError(zcodeErr),
+			"result": zcodeResult,
+		},
+	})
 }
 
 func (s *Server) reorderAccounts(w http.ResponseWriter, r *http.Request) {
@@ -977,6 +1009,13 @@ func nullable(value string) any {
 		return nil
 	}
 	return value
+}
+
+func nullableError(err error) any {
+	if err == nil {
+		return nil
+	}
+	return err.Error()
 }
 
 func nullableThinking(value state.ThinkingSettings, exists bool) any {

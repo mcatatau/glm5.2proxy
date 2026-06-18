@@ -11,7 +11,7 @@ import { Button } from '@/components/ui/button'
 import { useAccounts } from '@/hooks/use-accounts'
 import { useSettings } from '@/hooks/use-settings'
 import { api } from '@/lib/api'
-import type { Account, ThinkingSettings } from '@/types/api'
+import type { Account, AccountActivateResponse, ThinkingSettings, ZCodeApplyResult } from '@/types/api'
 
 function move(items: Account[], from: number, to: number): Account[] {
   const next = [...items]
@@ -28,6 +28,15 @@ function formatElapsed(from: number, now: number): string {
   return `${minutes}m ${seconds}s`
 }
 
+function zcodeApplyMessage(result: ZCodeApplyResult): string {
+  if (result.liveRefreshPossible) return 'Conta aplicada no ZCode e refresh live disponivel.'
+  if (result.liveRefreshQueued) {
+    return 'Conta gravada no ZCode e refresh live enfileirado. Com o bridge v2 instalado, a janela do ZCode recarrega sozinha para mostrar o perfil certo.'
+  }
+  const suffix = result.liveRefreshReason ? ` Motivo: ${result.liveRefreshReason}` : ''
+  return `Conta gravada no ZCode. A janela aberta pode continuar usando a credencial antiga ate o ZCode recarregar o runtime.${suffix}`
+}
+
 export function Home() {
   const { data: accountsData, loading, error: accountsError, refresh, reorder } = useAccounts()
   const settingsState = useSettings()
@@ -38,6 +47,7 @@ export function Home() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [switchEvent, setSwitchEvent] = useState<{ fromId: string | null; toId: string; timestamp: number } | null>(null)
+  const [zcodeSync, setZCodeSync] = useState<Record<string, { status: 'idle' | 'syncing' | 'synced' | 'skipped' | 'error'; message: string | null }>>({})
   const [now, setNow] = useState(() => Date.now())
   const dragOrderRef = useRef<Account[]>([])
   const previousActiveIdRef = useRef<string | null>(null)
@@ -99,8 +109,34 @@ export function Home() {
   }
 
   const activate = async (id: string) => {
-    await api.post(`/api/admin/accounts/${id}/activate`)
-    await refresh()
+    setZCodeSync((current) => ({ ...current, [id]: { status: 'syncing', message: 'Aplicando esta conta no ambiente interno do ZCode...' } }))
+    try {
+      const result = await api.post<AccountActivateResponse>(`/api/admin/accounts/${id}/activate`)
+      const zcode = result.zcode
+      setZCodeSync((current) => ({
+        ...current,
+        [id]: zcode?.synced
+          ? { status: 'synced', message: zcode.result ? zcodeApplyMessage(zcode.result) : 'Conta gravada no ZCode.' }
+          : zcode?.error
+            ? { status: 'error', message: `Proxy ativado, mas ZCode falhou: ${zcode.error}` }
+            : { status: 'skipped', message: 'Proxy ativado. Ambiente interno do ZCode nao foi detectado, sincronizacao ignorada.' },
+      }))
+      await refresh()
+    } catch (err) {
+      setZCodeSync((current) => ({ ...current, [id]: { status: 'error', message: err instanceof Error ? err.message : 'Falha ao ativar conta' } }))
+      throw err
+    }
+  }
+
+  const applyAccountInZCode = async (id: string) => {
+    setZCodeSync((current) => ({ ...current, [id]: { status: 'syncing', message: 'Aplicando manualmente no ZCode...' } }))
+    try {
+      const response = await api.post<{ data: ZCodeApplyResult }>(`/api/admin/zcode/accounts/${id}/activate`)
+      setZCodeSync((current) => ({ ...current, [id]: { status: 'synced', message: zcodeApplyMessage(response.data) } }))
+    } catch (err) {
+      setZCodeSync((current) => ({ ...current, [id]: { status: 'error', message: err instanceof Error ? err.message : 'Falha ao aplicar no ZCode' } }))
+      throw err
+    }
   }
 
   const refreshAccounts = async () => {
@@ -279,12 +315,15 @@ export function Home() {
                     globalThinking={settings?.globalThinking ?? null}
                     accountThinking={settings?.accountThinking?.[account.id] ?? null}
                     onActivate={() => activate(account.id)}
+                    onApplyZCode={() => applyAccountInZCode(account.id)}
                     onMoveUp={() => moveAccount(index, -1)}
                     onMoveDown={() => moveAccount(index, 1)}
                     onRefresh={refreshAccounts}
                     onDragEnd={() => persistOrder(dragOrderRef.current)}
                     onSaveThinking={(value) => saveAccountThinking(account.id, value)}
                     onResetThinking={() => resetAccountThinking(account.id)}
+                    zcodeSyncStatus={zcodeSync[account.id]?.status}
+                    zcodeSyncMessage={zcodeSync[account.id]?.message}
                   />
                 ))}
               </Reorder.Group>

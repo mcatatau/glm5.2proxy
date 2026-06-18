@@ -5,11 +5,15 @@ import {
   ArrowUp,
   BrainCircuit,
   Check,
+  CircleAlert,
+  CircleCheck,
+  Loader2,
   Gauge,
   GripVertical,
   RefreshCw,
   RotateCcw,
   Save,
+  SquareCode,
   UserRound,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -28,12 +32,15 @@ interface AccountCardProps {
   globalThinking: ThinkingSettings | null
   accountThinking: ThinkingSettings | null
   onActivate: () => void
+  onApplyZCode: () => Promise<void>
   onMoveUp: () => void
   onMoveDown: () => void
   onRefresh: () => void
   onDragEnd: () => void
   onSaveThinking: (value: ThinkingSettings) => Promise<void>
   onResetThinking: () => Promise<void>
+  zcodeSyncStatus?: 'idle' | 'syncing' | 'synced' | 'skipped' | 'error'
+  zcodeSyncMessage?: string | null
 }
 
 const DEFAULT_THINKING: ThinkingSettings = {
@@ -287,16 +294,44 @@ export function AccountCard({
   globalThinking,
   accountThinking,
   onActivate,
+  onApplyZCode,
   onMoveUp,
   onMoveDown,
   onRefresh,
   onDragEnd,
   onSaveThinking,
   onResetThinking,
+  zcodeSyncStatus = 'idle',
+  zcodeSyncMessage = null,
 }: AccountCardProps) {
   const dragControls = useDragControls()
   const displayName = account.user.name || account.label
   const email = account.user.email || account.user.id || account.id
+  const [applyingZCode, setApplyingZCode] = useState(false)
+  const [zcodeMessage, setZCodeMessage] = useState<string | null>(null)
+  const effectiveZCodeStatus = applyingZCode ? 'syncing' : zcodeSyncStatus
+  const effectiveZCodeMessage = zcodeMessage ?? zcodeSyncMessage
+
+  const applyZCode = async () => {
+    if (!account.hasZcodeJwtToken) {
+      setZCodeMessage('Essa conta antiga nao tem JWT salvo; faca login novamente nela para conseguir migrar para o ZCode.')
+      return
+    }
+    setApplyingZCode(true)
+    setZCodeMessage(null)
+    try {
+      await onApplyZCode()
+      setZCodeMessage(
+        account.hasZaiAccessToken
+          ? 'Aplicada no ZCode com JWT e sessao OAuth. Com o bridge v2 instalado, a janela do ZCode recarrega para mostrar o perfil certo.'
+          : 'Aplicada no ZCode usando JWT antigo. Se o ZCode pedir login, essa conta precisa ser recadastrada.'
+      )
+    } catch (err) {
+      setZCodeMessage(err instanceof Error ? err.message : 'Nao foi possivel aplicar no ZCode')
+    } finally {
+      setApplyingZCode(false)
+    }
+  }
 
   return (
     <Reorder.Item
@@ -402,7 +437,50 @@ export function AccountCard({
                 >
                   {isActive ? 'Conta ativa' : 'Usar agora'}
                 </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={applyingZCode || !account.hasZcodeJwtToken}
+                  onClick={applyZCode}
+                  title={account.hasZcodeJwtToken ? 'Grava esta conta no ambiente interno do app ZCode' : 'Conta antiga sem JWT salvo'}
+                >
+                  <SquareCode className="h-3.5 w-3.5" />
+                  {applyingZCode ? 'Aplicando...' : 'Aplicar no ZCode'}
+                </Button>
               </div>
+            </div>
+
+            {zcodeMessage && (
+              <p className="mt-3 rounded-md border border-sky-500/25 bg-sky-500/5 px-3 py-2 text-[11px] text-sky-300">
+                {zcodeMessage}
+              </p>
+            )}
+            <div
+              className={cn(
+                'mt-3 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-[11px]',
+                effectiveZCodeStatus === 'synced' && 'border-emerald-500/30 bg-emerald-500/7 text-emerald-300',
+                effectiveZCodeStatus === 'syncing' && 'border-sky-500/30 bg-sky-500/7 text-sky-300',
+                effectiveZCodeStatus === 'error' && 'border-red-500/30 bg-red-500/7 text-red-300',
+                effectiveZCodeStatus === 'skipped' && 'border-amber-500/30 bg-amber-500/7 text-amber-300',
+                effectiveZCodeStatus === 'idle' && 'border-border/60 bg-background/35 text-muted-foreground'
+              )}
+            >
+              {effectiveZCodeStatus === 'syncing' ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : effectiveZCodeStatus === 'synced' ? (
+                <CircleCheck className="h-3.5 w-3.5" />
+              ) : effectiveZCodeStatus === 'error' || effectiveZCodeStatus === 'skipped' ? (
+                <CircleAlert className="h-3.5 w-3.5" />
+              ) : (
+                <SquareCode className="h-3.5 w-3.5" />
+              )}
+              <span className="font-semibold">ZCode</span>
+              <span>
+                {effectiveZCodeMessage ??
+                  (account.hasZcodeJwtToken
+                    ? 'Ao usar esta conta, o proxy tenta aplicar ela automaticamente no app ZCode detectado.'
+                    : 'Conta sem JWT salvo; nao da para aplicar no ZCode sem fazer login novamente.')}
+              </span>
             </div>
 
             <ThinkingControl

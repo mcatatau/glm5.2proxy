@@ -3,7 +3,9 @@ package quota
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -114,6 +116,28 @@ func (s *Service) ModelBalance(ctx context.Context, upstreamConfig upstream.Conf
 }
 
 func (s *Service) fetch(ctx context.Context, upstreamConfig upstream.Config, kind string) (map[string]any, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		body, err := s.fetchOnce(ctx, upstreamConfig, kind)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !retryable(err) || attempt == 2 {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+func (s *Service) fetchOnce(ctx context.Context, upstreamConfig upstream.Config, kind string) (map[string]any, error) {
 	appVersion := upstreamConfig.BaseHeaders["x-zcode-app-version"]
 	if appVersion == "" {
 		appVersion = s.cfg.AppVersion
@@ -139,6 +163,17 @@ func (s *Service) fetch(ctx context.Context, upstreamConfig upstream.Config, kin
 		return nil, fmt.Errorf("billing %s failed: HTTP %d %s", kind, response.StatusCode, first(text(body["msg"]), text(body["message"])))
 	}
 	return body, nil
+}
+
+func retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	value := strings.ToLower(err.Error())
+	return strings.Contains(value, "connection reset") || strings.Contains(value, "server closed idle connection") || strings.Contains(value, "timeout")
 }
 
 func normalizeSnapshot(current, balances map[string]any) Snapshot {

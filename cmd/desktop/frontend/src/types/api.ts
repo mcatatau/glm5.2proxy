@@ -28,12 +28,66 @@ export interface Account {
   }
   quota: QuotaSnapshot | null
   quotaError: { message: string; type: string } | null
+  hasZcodeJwtToken: boolean
+  hasZaiAccessToken: boolean
+  tokenExpiresAt: string | null
+  tokenExpired: boolean | null
 }
 
 export interface AccountsResponse {
   object: string
   activeAccountId: string | null
   data: Account[]
+}
+
+export interface ZCodeEnvironment {
+  homeDir: string
+  dataDir: string
+  credentialsPath: string
+  configPath: string
+  settingPath: string
+  codingPlanPath: string
+  installPath?: string
+  appServerScript?: string
+  runningProcesses: Array<{
+    pid: number
+    executable?: string
+    commandLine?: string
+    role: string
+  }>
+  currentUser?: {
+    id?: string
+    email?: string
+    name?: string
+  }
+  credentialsPresent: boolean
+  configPresent: boolean
+  detectedAt: string
+  restartRecommended: boolean
+  liveRefreshPossible: boolean
+  liveRefreshReason?: string
+  warnings?: string[]
+}
+
+export interface ZCodeApplyResult {
+  environment: ZCodeEnvironment
+  account: Account
+  backupPath?: string
+  configUpdated: boolean
+  credentialsUpdated: boolean
+  restartRecommended: boolean
+  liveRefreshPossible: boolean
+  liveRefreshReason?: string
+  liveRefreshQueued: boolean
+}
+
+export interface AccountActivateResponse {
+  activeAccount: Account
+  zcode?: {
+    synced: boolean
+    error: string | null
+    result: ZCodeApplyResult | null
+  }
 }
 
 export interface APIKey {
