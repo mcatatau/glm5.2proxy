@@ -41,6 +41,9 @@ type Environment struct {
 	RestartRecommended  bool         `json:"restartRecommended"`
 	LiveRefreshPossible bool         `json:"liveRefreshPossible"`
 	LiveRefreshReason   string       `json:"liveRefreshReason,omitempty"`
+	BridgeInstalled     bool         `json:"bridgeInstalled"`
+	BridgeVersion       string       `json:"bridgeVersion,omitempty"`
+	BridgeScriptPath    string       `json:"bridgeScriptPath,omitempty"`
 	Warnings            []string     `json:"warnings,omitempty"`
 }
 
@@ -67,7 +70,23 @@ type ApplyResult struct {
 	LiveRefreshPossible bool                   `json:"liveRefreshPossible"`
 	LiveRefreshReason   string                 `json:"liveRefreshReason,omitempty"`
 	LiveRefreshQueued   bool                   `json:"liveRefreshQueued"`
+	BridgePatched       bool                   `json:"bridgePatched"`
+	BridgePatchMessage  string                 `json:"bridgePatchMessage,omitempty"`
+	BridgeRestartedApp  bool                   `json:"bridgeRestartedApp"`
 }
+
+type BridgePatchResult struct {
+	Installed    bool
+	Version      string
+	Updated      bool
+	RestartedApp bool
+	Message      string
+}
+
+const (
+	bridgeMarkerV1 = "__GLM52_PROXY_BRIDGE__"
+	bridgeMarkerV2 = "__GLM52_PROXY_BRIDGE_RELOAD_V2__"
+)
 
 func Detect() Environment {
 	home, _ := os.UserHomeDir()
@@ -117,6 +136,18 @@ func Detect() Environment {
 			env.Warnings = append(env.Warnings, "Nao foi possivel descriptografar o usuario atual do ZCode: "+err.Error())
 		}
 	}
+	env.BridgeScriptPath = bridgeScriptPath()
+	if installed, version, err := detectBridge(env); err == nil {
+		env.BridgeInstalled = installed
+		env.BridgeVersion = version
+		env.LiveRefreshPossible = installed
+		if installed {
+			env.RestartRecommended = false
+			env.LiveRefreshReason = "Bridge do renderer detectado; o proxy consegue enfileirar o refresh e o ZCode recarrega a janela automaticamente."
+		}
+	} else if env.InstallPath != "" {
+		env.Warnings = append(env.Warnings, "Nao foi possivel verificar o bridge do ZCode: "+err.Error())
+	}
 	sort.SliceStable(env.RunningProcesses, func(i, j int) bool { return env.RunningProcesses[i].PID < env.RunningProcesses[j].PID })
 	return env
 }
@@ -126,10 +157,19 @@ func Available(env Environment) bool {
 }
 
 func ApplyAccount(account accounts.Account) (ApplyResult, error) {
+	return ApplyAccountWithBridge(account, "")
+}
+
+func ApplyAccountWithBridge(account accounts.Account, proxyBaseURL string) (ApplyResult, error) {
 	env := Detect()
 	if account.ZCodeJWTToken == "" {
 		return ApplyResult{}, errors.New("conta sem zcodeJwtToken salvo")
 	}
+	patchResult, err := ensureBridgeInstalled(env, proxyBaseURL)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	env = Detect()
 	if err := os.MkdirAll(env.DataDir, 0o700); err != nil {
 		return ApplyResult{}, err
 	}
@@ -149,10 +189,138 @@ func ApplyAccount(account accounts.Account) (ApplyResult, error) {
 		BackupPath:          backup,
 		ConfigUpdated:       configUpdated,
 		CredentialsUpdated:  true,
-		RestartRecommended:  true,
-		LiveRefreshPossible: false,
+		RestartRecommended:  !env.LiveRefreshPossible,
+		LiveRefreshPossible: env.LiveRefreshPossible,
 		LiveRefreshReason:   env.LiveRefreshReason,
+		BridgePatched:       patchResult.Updated,
+		BridgePatchMessage:  patchResult.Message,
+		BridgeRestartedApp:  patchResult.RestartedApp,
 	}, nil
+}
+
+func ensureBridgeInstalled(env Environment, proxyBaseURL string) (BridgePatchResult, error) {
+	if runtime.GOOS != "windows" {
+		return BridgePatchResult{}, nil
+	}
+	if env.InstallPath == "" {
+		return BridgePatchResult{}, nil
+	}
+	if env.BridgeInstalled && env.BridgeVersion == "v2" {
+		return BridgePatchResult{
+			Installed: true,
+			Version:   env.BridgeVersion,
+			Message:   "Bridge v2 do ZCode ja estava instalado.",
+		}, nil
+	}
+	scriptPath := env.BridgeScriptPath
+	if scriptPath == "" {
+		return BridgePatchResult{}, errors.New("script de patch do ZCode nao foi encontrado no projeto")
+	}
+	asarPath := filepath.Join(filepath.Dir(env.InstallPath), "resources", "app.asar")
+	args := []string{
+		"-NoProfile",
+		"-ExecutionPolicy", "Bypass",
+		"-File", scriptPath,
+		"-ZCodeAsarPath", asarPath,
+		"-ProxyBaseUrl", effectiveProxyBaseURL(proxyBaseURL),
+	}
+	if len(env.RunningProcesses) > 0 {
+		args = append(args, "-ForceKill")
+	}
+	output, err := exec.Command("powershell", args...).CombinedOutput()
+	if err != nil {
+		text := strings.TrimSpace(string(output))
+		if text != "" {
+			return BridgePatchResult{}, fmt.Errorf("falha ao instalar bridge do ZCode: %s", text)
+		}
+		return BridgePatchResult{}, fmt.Errorf("falha ao instalar bridge do ZCode: %w", err)
+	}
+	restarted := false
+	if len(env.RunningProcesses) > 0 {
+		if err := exec.Command(env.InstallPath).Start(); err == nil {
+			restarted = true
+		}
+	}
+	verifiedEnv := Detect()
+	if !verifiedEnv.BridgeInstalled || verifiedEnv.BridgeVersion != "v2" {
+		return BridgePatchResult{}, errors.New("o patch terminou, mas o bridge v2 nao foi detectado no ZCode")
+	}
+	message := strings.TrimSpace(string(output))
+	if message == "" {
+		message = "Bridge v2 do ZCode instalado automaticamente."
+	}
+	return BridgePatchResult{
+		Installed:    true,
+		Version:      verifiedEnv.BridgeVersion,
+		Updated:      true,
+		RestartedApp: restarted,
+		Message:      compactLines(message),
+	}, nil
+}
+
+func detectBridge(env Environment) (bool, string, error) {
+	if env.InstallPath == "" {
+		return false, "", nil
+	}
+	asarPath := filepath.Join(filepath.Dir(env.InstallPath), "resources", "app.asar")
+	raw, err := os.ReadFile(asarPath)
+	if err != nil {
+		return false, "", err
+	}
+	switch {
+	case bytes.Contains(raw, []byte(bridgeMarkerV2)):
+		return true, "v2", nil
+	case bytes.Contains(raw, []byte(bridgeMarkerV1)):
+		return true, "v1", nil
+	default:
+		return false, "", nil
+	}
+}
+
+func bridgeScriptPath() string {
+	candidates := []string{}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, "scripts", "patch-zcode-live-refresh.ps1"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		base := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(base, "scripts", "patch-zcode-live-refresh.ps1"),
+			filepath.Join(base, "..", "scripts", "patch-zcode-live-refresh.ps1"),
+			filepath.Join(base, "..", "..", "scripts", "patch-zcode-live-refresh.ps1"),
+		)
+	}
+	for _, candidate := range candidates {
+		resolved, err := filepath.Abs(candidate)
+		if err == nil && fileExists(resolved) {
+			return resolved
+		}
+	}
+	return ""
+}
+
+func effectiveProxyBaseURL(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "http://127.0.0.1:3005"
+	}
+	return strings.TrimRight(trimmed, "/")
+}
+
+func compactLines(value string) string {
+	lines := strings.FieldsFunc(value, func(r rune) bool { return r == '\r' || r == '\n' })
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	if len(filtered) == 0 {
+		return ""
+	}
+	return strings.Join(filtered, " | ")
 }
 
 func writeCredentials(path string, cipher Cipher, account accounts.Account) (string, error) {

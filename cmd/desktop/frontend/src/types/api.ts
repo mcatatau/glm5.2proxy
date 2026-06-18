@@ -66,6 +66,9 @@ export interface ZCodeEnvironment {
   restartRecommended: boolean
   liveRefreshPossible: boolean
   liveRefreshReason?: string
+  bridgeInstalled: boolean
+  bridgeVersion?: string
+  bridgeScriptPath?: string
   warnings?: string[]
 }
 
@@ -79,6 +82,9 @@ export interface ZCodeApplyResult {
   liveRefreshPossible: boolean
   liveRefreshReason?: string
   liveRefreshQueued: boolean
+  bridgePatched: boolean
+  bridgePatchMessage?: string
+  bridgeRestartedApp: boolean
 }
 
 export interface AccountActivateResponse {

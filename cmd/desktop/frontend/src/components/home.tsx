@@ -29,6 +29,12 @@ function formatElapsed(from: number, now: number): string {
 }
 
 function zcodeApplyMessage(result: ZCodeApplyResult): string {
+  if (result.bridgePatched) {
+    const restartText = result.bridgeRestartedApp
+      ? ' O ZCode foi reiniciado uma vez para carregar o bridge.'
+      : ''
+    return `${result.bridgePatchMessage ?? 'Bridge do ZCode instalado automaticamente.'}${restartText} A conta foi aplicada e o refresh live ficou pronto.`
+  }
   if (result.liveRefreshPossible) return 'Conta aplicada no ZCode e refresh live disponivel.'
   if (result.liveRefreshQueued) {
     return 'Conta gravada no ZCode e refresh live enfileirado. Com o bridge v2 instalado, a janela do ZCode recarrega sozinha para mostrar o perfil certo.'
