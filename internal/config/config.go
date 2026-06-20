@@ -70,7 +70,7 @@ func Load() Config {
 		BillingBaseURL:         env("ZCODE_BILLING_BASE_URL", "https://zcode.z.ai/api/v1/zcode-plan/billing"),
 		OAuthBaseURL:           env("ZCODE_OAUTH_BASE_URL", "https://zcode.z.ai/api/v1"),
 		OAuthProvider:          env("ZCODE_OAUTH_PROVIDER", "zai"),
-		AppVersion:             env("ZCODE_APP_VERSION", "3.0.1"),
+		AppVersion:             env("ZCODE_APP_VERSION", "3.1.2"),
 		Platform:               env("ZCODE_PLATFORM", platform()),
 		Authorization:          os.Getenv("ZCODE_AUTHORIZATION"),
 		CredentialSecret:       os.Getenv("ZCODE_PROXY_CREDENTIAL_SECRET"),

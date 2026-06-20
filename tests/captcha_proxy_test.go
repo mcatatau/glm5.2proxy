@@ -37,7 +37,7 @@ func TestCaptchaBridgeAndProxyRetry(t *testing.T) {
 	if err := json.Unmarshal(pollRecorder.Body.Bytes(), &captchaRequest); err != nil {
 		t.Fatal(err)
 	}
-	submit := httptest.NewRequest(http.MethodPost, "/zcode/captcha/submit", strings.NewReader(`{"id":"`+captchaRequest.ID+`","token":"proof"}`))
+	submit := httptest.NewRequest(http.MethodPost, "/zcode/captcha/submit", strings.NewReader(`{"id":"`+captchaRequest.ID+`","token":"proof","region":"sgp"}`))
 	submit.Header.Set("Content-Type", "application/json")
 	bridge.Submit(httptest.NewRecorder(), submit)
 	if token := <-tokenResult; token != "proof" {
@@ -92,6 +92,84 @@ func TestProxyRetriesAdmissionConcurrencyLimit(t *testing.T) {
 	completion, _, err := service.Collect(context.Background(), upstream.Config{Endpoint: mock.URL, BaseHeaders: map[string]string{"authorization": "Bearer test"}, HasAuthorization: true}, map[string]any{"model": "GLM-5.2"})
 	if err != nil || completion.Text != "ok" || attempts.Load() != 2 || sessions[0] == "" || sessions[0] != sessions[1] || requestIDs[0] == "" || requestIDs[0] != requestIDs[1] || traceIDs[0] == "" || traceIDs[0] != traceIDs[1] || queryIDs[0] == "" || queryIDs[0] != queryIDs[1] {
 		t.Fatalf("admission retry failed: completion=%+v attempts=%d sessions=%v requestIDs=%v traceIDs=%v queryIDs=%v err=%v", completion, attempts.Load(), sessions, requestIDs, traceIDs, queryIDs, err)
+	}
+}
+
+func TestProxyDoesNotPrefetchCaptchaForNormalRequest(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.CaptchaEnabled = true
+	bridge := captcha.NewBridge(cfg)
+	var attempts atomic.Int32
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		if value := r.Header.Get("X-Aliyun-Captcha-Verify-Param"); value != "" {
+			t.Fatalf("normal request should not prefetch captcha token, got %q", value)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer mock.Close()
+
+	service := proxy.New(cfg, bridge)
+	completion, streamAttempts, err := service.Collect(context.Background(), upstream.Config{Endpoint: mock.URL, BaseHeaders: map[string]string{"authorization": "Bearer test"}, HasAuthorization: true}, map[string]any{"model": "GLM-5.2"})
+	if err != nil || completion.Text != "ok" || streamAttempts != 1 || attempts.Load() != 1 {
+		t.Fatalf("normal request failed: completion=%+v streamAttempts=%d upstreamAttempts=%d err=%v", completion, streamAttempts, attempts.Load(), err)
+	}
+}
+
+func TestProxyFetchesCaptchaOnlyAfterUpstreamChallenge(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.CaptchaEnabled = true
+	cfg.RetryBaseDelay = time.Millisecond
+	bridge := captcha.NewBridge(cfg)
+
+	pollDone := make(chan captcha.Request, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/zcode/captcha/poll?client=headless-browser", nil)
+		bridge.Poll(recorder, request)
+		var captchaRequest captcha.Request
+		_ = json.Unmarshal(recorder.Body.Bytes(), &captchaRequest)
+		pollDone <- captchaRequest
+	}()
+	go func() {
+		captchaRequest := <-pollDone
+		submit := httptest.NewRequest(http.MethodPost, "/zcode/captcha/submit", strings.NewReader(`{"id":"`+captchaRequest.ID+`","token":"proof","region":"sgp"}`))
+		submit.Header.Set("Content-Type", "application/json")
+		bridge.Submit(httptest.NewRecorder(), submit)
+	}()
+
+	var attempts atomic.Int32
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := attempts.Add(1)
+		if current == 1 {
+			if value := r.Header.Get("X-Aliyun-Captcha-Verify-Param"); value != "" {
+				t.Fatalf("first request should not include captcha token, got %q", value)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"message":"captcha verification required","type":"zcode_upstream_error"}}`))
+			return
+		}
+		if value := r.Header.Get("X-Aliyun-Captcha-Verify-Param"); value != "proof" {
+			t.Fatalf("second request should include fresh captcha token, got %q", value)
+		}
+		if value := r.Header.Get("X-Aliyun-Captcha-Verify-Region"); value != "sgp" {
+			t.Fatalf("second request should include captcha region, got %q", value)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer mock.Close()
+
+	service := proxy.New(cfg, bridge)
+	completion, streamAttempts, err := service.Collect(context.Background(), upstream.Config{Endpoint: mock.URL, BaseHeaders: map[string]string{"authorization": "Bearer test"}, HasAuthorization: true}, map[string]any{"model": "GLM-5.2"})
+	if err != nil || completion.Text != "ok" || streamAttempts != 2 || attempts.Load() != 2 {
+		t.Fatalf("captcha retry failed: completion=%+v streamAttempts=%d upstreamAttempts=%d err=%v", completion, streamAttempts, attempts.Load(), err)
 	}
 }
 
@@ -244,6 +322,13 @@ func TestAdmissionConcurrencyIsNotQuotaExhausted(t *testing.T) {
 	err := &proxy.UpstreamError{Status: http.StatusTooManyRequests, Message: "model admission concurrency limit exceeded"}
 	if proxy.IsQuotaExhausted(err) {
 		t.Fatal("admission concurrency should wait/retry, not rotate as quota exhaustion")
+	}
+}
+
+func TestUnknownTooManyRequestsIsQuotaOrRateLimited(t *testing.T) {
+	err := &proxy.UpstreamError{Status: http.StatusTooManyRequests, Message: "Unknown upstream error"}
+	if !proxy.IsQuotaExhausted(err) {
+		t.Fatal("unknown 429 should be treated as account-rotatable quota/rate limit")
 	}
 }
 

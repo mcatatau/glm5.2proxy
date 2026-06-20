@@ -70,10 +70,18 @@ type Service struct {
 	snapshotCacheMu  sync.Mutex
 	snapshotCache    map[string]snapshotCacheEntry
 	snapshotInFlight map[string]chan struct{}
+	balanceCache     map[string]balanceCacheEntry
+	balanceInFlight  map[string]chan struct{}
 }
 
 type snapshotCacheEntry struct {
 	snapshot  Snapshot
+	err       error
+	updatedAt time.Time
+}
+
+type balanceCacheEntry struct {
+	body      map[string]any
 	err       error
 	updatedAt time.Time
 }
@@ -85,6 +93,8 @@ func New(cfg config.Config) *Service {
 		requestGate:      make(chan struct{}, 1),
 		snapshotCache:    map[string]snapshotCacheEntry{},
 		snapshotInFlight: map[string]chan struct{}{},
+		balanceCache:     map[string]balanceCacheEntry{},
+		balanceInFlight:  map[string]chan struct{}{},
 	}
 }
 
@@ -148,15 +158,65 @@ func (s *Service) ModelBalance(ctx context.Context, upstreamConfig upstream.Conf
 	if err != nil {
 		return nil, err
 	}
+	return modelBalanceFromBody(body, model), nil
+}
+
+func (s *Service) ModelBalanceCached(ctx context.Context, upstreamConfig upstream.Config, model models.Model, maxAge time.Duration) (*Balance, error) {
+	if !upstreamConfig.HasAuthorization {
+		return nil, nil
+	}
+	if maxAge <= 0 {
+		return s.ModelBalance(ctx, upstreamConfig, model)
+	}
+	body, err := s.balanceBodyCached(ctx, upstreamConfig, maxAge)
+	if err != nil {
+		return nil, err
+	}
+	return modelBalanceFromBody(body, model), nil
+}
+
+func modelBalanceFromBody(body map[string]any, model models.Model) *Balance {
 	data := object(body["data"])
 	for _, item := range array(data["balances"]) {
 		value := object(item)
 		if strings.EqualFold(text(value["show_name"]), model.UpstreamID) {
 			balance := normalizeBalance(value)
-			return &balance, nil
+			return &balance
 		}
 	}
-	return nil, nil
+	return nil
+}
+
+func (s *Service) balanceBodyCached(ctx context.Context, upstreamConfig upstream.Config, maxAge time.Duration) (map[string]any, error) {
+	key := s.snapshotCacheKey(upstreamConfig)
+	for {
+		s.snapshotCacheMu.Lock()
+		if entry, ok := s.balanceCache[key]; ok && time.Since(entry.updatedAt) <= maxAge {
+			s.snapshotCacheMu.Unlock()
+			return entry.body, entry.err
+		}
+		if inFlight, ok := s.balanceInFlight[key]; ok {
+			s.snapshotCacheMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-inFlight:
+				continue
+			}
+		}
+		inFlight := make(chan struct{})
+		s.balanceInFlight[key] = inFlight
+		s.snapshotCacheMu.Unlock()
+
+		body, err := s.fetch(ctx, upstreamConfig, "balance")
+
+		s.snapshotCacheMu.Lock()
+		s.balanceCache[key] = balanceCacheEntry{body: body, err: err, updatedAt: time.Now()}
+		close(inFlight)
+		delete(s.balanceInFlight, key)
+		s.snapshotCacheMu.Unlock()
+		return body, err
+	}
 }
 
 func (s *Service) snapshotCacheKey(upstreamConfig upstream.Config) string {

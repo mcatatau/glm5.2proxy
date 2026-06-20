@@ -86,7 +86,7 @@ func (l *Loader) Load(account *accounts.Account) Config {
 			activeSource = "builtin:zai-start-plan"
 		}
 	}
-	captcha := first(os.Getenv("ZCODE_CAPTCHA_VERIFY_PARAM"), header(headers, "X-Aliyun-Captcha-Verify-Param"))
+	captcha := os.Getenv("ZCODE_CAPTCHA_VERIFY_PARAM")
 	baseHeaders := map[string]string{
 		"authorization":       authorization,
 		"http-referer":        first(os.Getenv("ZCODE_HTTP_REFERER"), header(headers, "HTTP-Referer"), "https://zcode.z.ai"),
@@ -98,6 +98,7 @@ func (l *Loader) Load(account *accounts.Account) Config {
 	}
 	if captcha != "" {
 		baseHeaders["x-aliyun-captcha-verify-param"] = captcha
+		baseHeaders["x-aliyun-captcha-verify-region"] = os.Getenv("ZCODE_CAPTCHA_VERIFY_REGION")
 	}
 	for key, value := range baseHeaders {
 		if value == "" {

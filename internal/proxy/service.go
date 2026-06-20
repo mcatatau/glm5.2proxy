@@ -73,8 +73,9 @@ func (s *Service) Request(ctx context.Context, upstreamConfig upstream.Config, b
 	if err != nil {
 		return nil, 0, err
 	}
+	captchaRequired := false
 	for attempt := 1; attempt <= s.cfg.RetryMaxAttempts; attempt++ {
-		prepared, prepareErr := s.runtime.Prepare(ctx, upstreamConfig)
+		prepared, prepareErr := s.prepareForAttempt(ctx, upstreamConfig, captchaRequired)
 		if prepareErr != nil {
 			return nil, attempt, prepareErr
 		}
@@ -88,6 +89,10 @@ func (s *Service) Request(ctx context.Context, upstreamConfig upstream.Config, b
 		}
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			upstreamError := decodeHTTPError(response)
+			if IsCaptchaChallenge(upstreamError) && attempt < s.cfg.RetryMaxAttempts {
+				captchaRequired = true
+				continue
+			}
 			if retryable(upstreamError) && attempt < s.cfg.RetryMaxAttempts {
 				s.wait(ctx, attempt, "retryable HTTP error")
 				continue
@@ -102,8 +107,9 @@ func (s *Service) Request(ctx context.Context, upstreamConfig upstream.Config, b
 
 func (s *Service) Collect(ctx context.Context, upstreamConfig upstream.Config, body map[string]any) (Completion, int, error) {
 	upstreamConfig = withStableLogicalRequestIDs(upstreamConfig)
+	captchaRequired := false
 	for attempt := 1; attempt <= s.cfg.RetryMaxAttempts; attempt++ {
-		prepared, prepareErr := s.runtime.Prepare(ctx, upstreamConfig)
+		prepared, prepareErr := s.prepareForAttempt(ctx, upstreamConfig, captchaRequired)
 		if prepareErr != nil {
 			return Completion{}, attempt, prepareErr
 		}
@@ -121,6 +127,10 @@ func (s *Service) Collect(ctx context.Context, upstreamConfig upstream.Config, b
 		}
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			upstreamErr := decodeHTTPError(response)
+			if IsCaptchaChallenge(upstreamErr) && attempt < s.cfg.RetryMaxAttempts {
+				captchaRequired = true
+				continue
+			}
 			if retryable(upstreamErr) && attempt < s.cfg.RetryMaxAttempts {
 				s.wait(ctx, attempt, "retryable upstream error")
 				continue
@@ -130,6 +140,10 @@ func (s *Service) Collect(ctx context.Context, upstreamConfig upstream.Config, b
 		completion, parseErr := collectSSE(response.Body)
 		response.Body.Close()
 		if parseErr != nil {
+			if IsCaptchaChallenge(parseErr) && attempt < s.cfg.RetryMaxAttempts {
+				captchaRequired = true
+				continue
+			}
 			if retryable(parseErr) && attempt < s.cfg.RetryMaxAttempts && completion.Text == "" && len(completion.ToolCalls) == 0 {
 				s.wait(ctx, attempt, "retryable SSE error")
 				continue
@@ -143,8 +157,9 @@ func (s *Service) Collect(ctx context.Context, upstreamConfig upstream.Config, b
 
 func (s *Service) Stream(ctx context.Context, upstreamConfig upstream.Config, body map[string]any, emit func(StreamEvent) error) (int, error) {
 	upstreamConfig = withStableLogicalRequestIDs(upstreamConfig)
+	captchaRequired := false
 	for attempt := 1; attempt <= s.cfg.RetryMaxAttempts; attempt++ {
-		prepared, prepareErr := s.runtime.Prepare(ctx, upstreamConfig)
+		prepared, prepareErr := s.prepareForAttempt(ctx, upstreamConfig, captchaRequired)
 		if prepareErr != nil {
 			return attempt, prepareErr
 		}
@@ -162,6 +177,10 @@ func (s *Service) Stream(ctx context.Context, upstreamConfig upstream.Config, bo
 		}
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			upstreamErr := decodeHTTPError(response)
+			if IsCaptchaChallenge(upstreamErr) && attempt < s.cfg.RetryMaxAttempts {
+				captchaRequired = true
+				continue
+			}
 			if retryable(upstreamErr) && attempt < s.cfg.RetryMaxAttempts {
 				s.wait(ctx, attempt, "retryable upstream error")
 				continue
@@ -259,6 +278,10 @@ func (s *Service) Stream(ctx context.Context, upstreamConfig upstream.Config, bo
 				streamErr = staleConnectionError()
 			}
 		}
+		if streamErr != nil && IsCaptchaChallenge(streamErr) && attempt < s.cfg.RetryMaxAttempts {
+			captchaRequired = true
+			continue
+		}
 		if streamErr != nil && retryable(streamErr) && attempt < s.cfg.RetryMaxAttempts {
 			s.wait(ctx, attempt, "retryable SSE error")
 			continue
@@ -273,6 +296,13 @@ func (s *Service) Stream(ctx context.Context, upstreamConfig upstream.Config, bo
 		return attempt, streamErr
 	}
 	return s.cfg.RetryMaxAttempts, &UpstreamError{Message: "ZCode upstream overloaded after retries", Type: "overloaded_error", Code: "1305"}
+}
+
+func (s *Service) prepareForAttempt(ctx context.Context, upstreamConfig upstream.Config, captchaRequired bool) (upstream.Config, error) {
+	if captchaRequired {
+		return s.runtime.PrepareWithCaptcha(ctx, upstreamConfig)
+	}
+	return s.runtime.Prepare(ctx, upstreamConfig)
 }
 
 func (s *Service) RequestSingleAttempt(ctx context.Context, upstreamConfig upstream.Config, body map[string]any) (*http.Response, int, error) {
@@ -497,6 +527,27 @@ func IsAuthFailed(err error) bool {
 	return upstreamError.Status == http.StatusUnauthorized
 }
 
+func IsCaptchaChallenge(err error) bool {
+	if err == nil {
+		return false
+	}
+	var upstreamError *UpstreamError
+	if !errors.As(err, &upstreamError) {
+		return false
+	}
+	value := strings.ToLower(strings.Join([]string{
+		upstreamError.Message,
+		upstreamError.Type,
+		fmt.Sprint(upstreamError.Code),
+	}, " "))
+	for _, marker := range []string{"captcha", "aliyun", "verify", "verification", "challenge", "risk control", "security check", "human"} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func staleConnectionError() error {
 	return &UpstreamError{Message: "upstream stream ended before producing text or tool calls", Type: "stale_connection", Status: http.StatusBadGateway}
 }
@@ -552,6 +603,9 @@ func IsQuotaExhausted(err error) bool {
 	}
 	if IsAdmissionConcurrency(err) {
 		return false
+	}
+	if upstreamError.Status == http.StatusTooManyRequests && strings.Contains(text, "unknown upstream error") {
+		return true
 	}
 	for _, marker := range []string{"quota", "exhaust", "insufficient", "balance", "credit", "available", "usage", "tokens"} {
 		if strings.Contains(text, marker) {

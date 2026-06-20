@@ -140,18 +140,13 @@ export function Home() {
   const activate = async (id: string) => {
     if (accountActionRef.current) return
     setAccountAction({ id, type: 'activate' })
-    setZCodeSync((current) => ({ ...current, [id]: { status: 'syncing', message: 'Aplicando esta conta no ambiente interno do ZCode...' } }))
+    setZCodeSync((current) => ({ ...current, [id]: { status: 'skipped', message: 'Conta ativa do proxy alterada. O ZCode nao foi modificado.' } }))
     try {
       const result = await api.post<AccountActivateResponse>(`/api/admin/accounts/${id}/activate`)
       setOptimisticActiveAccountId(result.activeAccount.id || id)
-      const zcode = result.zcode
       setZCodeSync((current) => ({
         ...current,
-        [id]: zcode?.synced
-          ? { status: 'synced', message: zcode.result ? zcodeApplyMessage(zcode.result) : 'Conta gravada no ZCode.' }
-          : zcode?.error
-            ? { status: 'error', message: `Proxy ativado, mas ZCode falhou: ${zcode.error}` }
-            : { status: 'skipped', message: 'Proxy ativado. Ambiente interno do ZCode nao foi detectado, sincronizacao ignorada.' },
+        [id]: { status: 'skipped', message: 'Conta ativa do proxy alterada. Use Aplicar no ZCode para mudar o app ZCode.' },
       }))
       await refresh({ cancelInFlight: true })
     } catch (err) {

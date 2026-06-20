@@ -6,10 +6,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"glm5.2proxy/internal/config"
+	"glm5.2proxy/internal/models"
 	"glm5.2proxy/internal/upstream"
 )
 
@@ -91,5 +94,56 @@ func TestSnapshotCachedReusesFreshSnapshot(t *testing.T) {
 	}
 	if currentCalls != 1 || balanceCalls != 1 {
 		t.Fatalf("expected cached quota snapshot, current=%d balance=%d", currentCalls, balanceCalls)
+	}
+}
+
+func TestModelBalanceCachedCoalescesConcurrentRequests(t *testing.T) {
+	var balanceCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/balance" {
+			http.NotFound(w, r)
+			return
+		}
+		balanceCalls.Add(1)
+		time.Sleep(25 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"balances":[{"show_name":"GLM-5.2","available_units":123}]}}`))
+	}))
+	defer server.Close()
+
+	cfg := config.Config{BillingBaseURL: server.URL, AppVersion: "3.1.2"}
+	service := New(cfg)
+	upstreamConfig := upstream.Config{
+		BaseHeaders: map[string]string{
+			"authorization":       "Bearer test-token",
+			"x-zcode-app-version": "3.1.2",
+		},
+		HasAuthorization: true,
+	}
+	model := models.Model{ID: "glm-5.2", UpstreamID: "GLM-5.2"}
+
+	var wait sync.WaitGroup
+	errs := make(chan error, 5)
+	for range 5 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			balance, err := service.ModelBalanceCached(context.Background(), upstreamConfig, model, time.Minute)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if balance == nil || balance.Available == nil || *balance.Available != 123 {
+				errs <- errors.New("unexpected cached balance")
+			}
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if balanceCalls.Load() != 1 {
+		t.Fatalf("expected one coalesced balance request, got %d", balanceCalls.Load())
 	}
 }

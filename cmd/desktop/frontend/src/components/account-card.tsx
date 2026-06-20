@@ -350,12 +350,12 @@ export function AccountCard({
   const effectiveZCodeMessage = zcodeMessage ?? zcodeSyncMessage
   const activateTooltip = isActive
     ? 'Esta ja e a conta ativa do proxy.'
-    : 'Troca a conta ativa do proxy agora. Tambem tenta sincronizar essa mesma conta no ZCode detectado.'
+    : 'Troca somente a conta ativa do proxy e da API OpenAI-compatible. Nao mexe no ZCode.'
   const applyZCodeTooltip = account.hasZcodeJwtToken
     ? 'So grava esta conta dentro do app ZCode detectado. Nao muda a conta ativa do proxy.'
     : 'Essa conta nao tem JWT salvo. Faca login novamente nela para conseguir aplicar no ZCode.'
   const deleteTooltip = isActive
-    ? 'Remove esta conta do proxy. Se ela estiver ativa, o proxy escolhe a proxima conta salva e tenta sincronizar o ZCode.'
+    ? 'Remove esta conta do proxy. Se ela estiver ativa, o proxy escolhe a proxima conta salva sem mexer no ZCode.'
     : 'Remove esta conta salva do proxy. Isso nao apaga a conta na Z.ai.'
 
   useEffect(() => {
@@ -594,7 +594,7 @@ export function AccountCard({
               <span>
                 {effectiveZCodeMessage ??
                   (account.hasZcodeJwtToken
-                    ? 'Ao usar esta conta, o proxy tenta aplicar ela automaticamente no app ZCode detectado.'
+                    ? 'Use Aplicar no ZCode para gravar esta conta no app ZCode detectado.'
                     : 'Conta sem JWT salvo; nao da para aplicar no ZCode sem fazer login novamente.')}
               </span>
             </div>

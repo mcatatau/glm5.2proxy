@@ -233,12 +233,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				delete(skipped, accountID)
 			}
 		}
-		s.logAndSyncAutoRotation(requestID, previousActive, selection.Account, model)
+		s.logAutoRotation(requestID, previousActive, selection.Account, model)
 		queueKey := requestqueue.Key(accountID, model.ID)
 		thinking := s.admin.ThinkingFor(accountID)
 		upstreamBody := openai.ToAnthropic(body, selection.Config.BodyTemplate, model, thinking, s.cfg.DefaultMaxTokens)
 		s.logs.add("info", "chat.started", fmt.Sprintf("Request %s iniciado com %s usando conta %s", requestID, model.ID, accountID))
-		before, _ := s.quota.ModelBalance(r.Context(), selection.Config, model)
+		before, _ := s.quota.ModelBalanceCached(r.Context(), selection.Config, model, 15*time.Second)
 		lease, err := s.queue.Acquire(r.Context(), queueKey)
 		if err != nil {
 			s.logs.add("warn", "chat.cancelled", fmt.Sprintf("Request %s cancelado enquanto aguardava fila %s: %v", requestID, queueKey, err))
@@ -247,8 +247,6 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		if lease.Position() > 0 {
 			s.logs.add("info", "queue.released", fmt.Sprintf("Request %s liberado apos aguardar fila %s", requestID, queueKey))
-			lease.Release()
-			continue
 		}
 		onSuccess := func() {
 			s.logs.add("info", "chat.completed", fmt.Sprintf("Request %s concluido com %s", requestID, model.ID))
@@ -348,7 +346,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, upstreamConf
 	return attempts, nil, true
 }
 
-func (s *Server) logAndSyncAutoRotation(requestID string, previousActive *accounts.Account, selected *accounts.Account, model models.Model) {
+func (s *Server) logAutoRotation(requestID string, previousActive *accounts.Account, selected *accounts.Account, model models.Model) {
 	if selected == nil {
 		return
 	}
@@ -365,16 +363,6 @@ func (s *Server) logAndSyncAutoRotation(requestID string, previousActive *accoun
 		"account.rotated",
 		fmt.Sprintf("Request %s trocou automaticamente a conta de %s para %s ao selecionar %s", requestID, fromLabel, toLabel, model.ID),
 	)
-	go func(accountID, accountLabel string) {
-		result, err := s.applyAccountInZCode(accountID)
-		if err != nil {
-			s.logs.add("warn", "zcode.auto_apply_failed", "Rotacao automatica selecionou "+accountLabel+", mas nao foi possivel aplicar no ZCode: "+err.Error())
-			return
-		}
-		if result != nil {
-			s.logs.add("info", "zcode.auto_applied", "Rotacao automatica aplicou "+accountLabel+" no ambiente interno do ZCode")
-		}
-	}(selected.ID, toLabel)
 }
 
 func (s *Server) skipQuotaExhaustedAccount(requestID, accountID string, model models.Model, err error, skipped map[string]bool) bool {
@@ -705,14 +693,8 @@ func (s *Server) activate(w http.ResponseWriter, id string) {
 		return
 	}
 	s.logs.add("info", "account.activated", "Conta ativa alterada para "+account.Label)
-	zcodeResult, zcodeErr := s.applyAccountInZCode(account.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"activeAccount": account,
-		"zcode": map[string]any{
-			"synced": zcodeErr == nil && zcodeResult != nil,
-			"error":  nullableError(zcodeErr),
-			"result": zcodeResult,
-		},
 	})
 }
 
@@ -742,8 +724,6 @@ func (s *Server) deleteAccountByPath(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) removeAccount(w http.ResponseWriter, id string) {
-	previousActive := s.accounts.Active()
-	removedActive := previousActive != nil && previousActive.ID == id
 	removed, err := s.accounts.Remove(id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "storage_error")
@@ -756,21 +736,11 @@ func (s *Server) removeAccount(w http.ResponseWriter, id string) {
 	s.logs.add("warn", "account.removed", "Conta removida do pool")
 	_ = s.admin.SetAccountThinking(id, nil)
 
-	var zcodeResult any
-	var zcodeErr error
 	nextActive := s.accounts.Active()
-	if removedActive && nextActive != nil {
-		zcodeResult, zcodeErr = s.applyAccountInZCode(nextActive.ID)
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"removed":       true,
 		"accountId":     id,
 		"activeAccount": sanitizePointer(nextActive),
-		"zcode": map[string]any{
-			"synced": zcodeErr == nil && zcodeResult != nil,
-			"error":  nullableError(zcodeErr),
-			"result": zcodeResult,
-		},
 	})
 }
 
@@ -1062,7 +1032,7 @@ func writeSSE(w http.ResponseWriter, value any) {
 
 func streaming(body map[string]any) bool {
 	value, ok := body["stream"].(bool)
-	return !ok || value
+	return ok && value
 }
 
 func nullable(value string) any {

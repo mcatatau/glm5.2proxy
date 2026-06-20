@@ -91,22 +91,12 @@ export interface ZCodeApplyResult {
 
 export interface AccountActivateResponse {
   activeAccount: Account
-  zcode?: {
-    synced: boolean
-    error: string | null
-    result: ZCodeApplyResult | null
-  }
 }
 
 export interface AccountDeleteResponse {
   removed: boolean
   accountId: string
   activeAccount: Account | null
-  zcode?: {
-    synced: boolean
-    error: string | null
-    result: ZCodeApplyResult | null
-  }
 }
 
 export interface APIKey {

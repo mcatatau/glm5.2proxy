@@ -96,7 +96,7 @@ Esse modo serve para:
 Nesse modo, o proxy nao serve apenas como API externa. Ele tambem conversa com
 o ambiente local do ZCode instalado na maquina.
 
-Quando voce usa `Aplicar no ZCode` ou ativa uma conta pelo fluxo integrado:
+Quando voce usa `Aplicar no ZCode`:
 
 - o proxy grava a conta nos arquivos internos do ZCode;
 - garante que o bridge do renderer esteja instalado;
@@ -115,9 +115,9 @@ Esse botao:
 
 - troca a conta ativa do proxy;
 - atualiza a conta que o modo OpenAI-compatible vai usar como base;
-- tenta sincronizar essa mesma conta no ZCode tambem.
+- nao grava nada no ambiente interno do ZCode.
 
-Esse e o botao certo quando voce quer mudar o estado geral do app.
+Esse e o botao certo quando voce quer mudar somente o proxy/API local.
 
 ### `Aplicar no ZCode`
 
@@ -138,8 +138,8 @@ Esse e o botao certo quando voce quer comandar so o ZCode.
 2. Adicione uma ou mais contas no painel.
 3. Organize a fila na ordem desejada.
 4. Passe o mouse nos botoes para ver a explicacao de cada um.
-5. Se quiser trocar tudo de uma vez, use `Usar agora`.
-6. Se quiser sincronizar so o app ZCode, use `Aplicar no ZCode`.
+5. Se quiser trocar a conta ativa do proxy/API, use `Usar agora`.
+6. Se quiser trocar a conta dentro do app ZCode, use `Aplicar no ZCode`.
 7. Aguarde o refresh live ou o pequeno reload do ZCode.
 8. Confirme no ZCode se o perfil/modelo esperado apareceu.
 

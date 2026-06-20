@@ -3,6 +3,7 @@ package accountpool
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"glm5.2proxy/internal/accounts"
 	"glm5.2proxy/internal/config"
@@ -65,7 +66,7 @@ func (p *Pool) SelectSkipping(ctx context.Context, model models.Model, skip map[
 			continue
 		}
 		upstreamConfig := p.loader.Load(&account)
-		balance, err := p.quota.ModelBalance(ctx, upstreamConfig, model)
+		balance, err := p.quota.ModelBalanceCached(ctx, upstreamConfig, model, 15*time.Second)
 		exhausted := balance != nil && balance.Available != nil && *balance.Available < p.cfg.AccountMinAvailable
 		result := inspected{account: account, config: upstreamConfig, balance: balance, exhausted: exhausted, err: err}
 		results = append(results, result)
@@ -106,7 +107,7 @@ func (p *Pool) Snapshot(ctx context.Context, model models.Model) map[string]any 
 		public := accounts.Sanitize(account)
 		public.QueuePosition = index + 1
 		public.Active = account.ID == activeID
-		balance, err := p.quota.ModelBalance(ctx, p.loader.Load(&account), model)
+		balance, err := p.quota.ModelBalanceCached(ctx, p.loader.Load(&account), model, 15*time.Second)
 		item := PoolItem{PublicAccount: public, Balance: balance}
 		if balance != nil {
 			item.Available = balance.Available

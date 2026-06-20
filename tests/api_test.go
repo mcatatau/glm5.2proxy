@@ -95,10 +95,18 @@ func TestChatWithoutZCodeAccountReturnsFriendlyAuthError(t *testing.T) {
 }
 
 func TestCaptchaBrowserUnavailableIsLoggedWithActionableEvent(t *testing.T) {
+	fakeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"captcha verification required","type":"zcode_upstream_error"}}`))
+	}))
+	defer fakeUpstream.Close()
+
 	cfg := testConfig(t)
 	cfg.Authorization = "Bearer test-token"
 	cfg.CaptchaEnabled = true
 	cfg.HeadlessEnabled = false
+	cfg.UpstreamURL = fakeUpstream.URL
 	admin, _ := state.NewAdminStore(cfg.AdminPath, 3005, state.ThinkingSettings{Enabled: true, BudgetTokens: 32000, Effort: "max"})
 	accountStore, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
 	loader := upstream.NewLoader(cfg, accountStore)
@@ -139,6 +147,55 @@ func TestCaptchaBrowserUnavailableIsLoggedWithActionableEvent(t *testing.T) {
 	last := entries[len(entries)-1].(map[string]any)
 	if last["event"] != "captcha.browser_disabled" || !strings.Contains(last["message"].(string), "/zcode/captcha/browser") {
 		t.Fatalf("unexpected captcha log: %+v", last)
+	}
+}
+
+func TestChatDefaultsToNonStreamingOpenAIResponse(t *testing.T) {
+	var upstreamBody map[string]any
+	fakeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Errorf("decode upstream body: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer fakeUpstream.Close()
+
+	cfg := testConfig(t)
+	cfg.Authorization = "Bearer test-token"
+	cfg.UpstreamURL = fakeUpstream.URL
+	admin, _ := state.NewAdminStore(cfg.AdminPath, 3005, state.ThinkingSettings{Enabled: true, BudgetTokens: 32000, Effort: "max"})
+	accountStore, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	loader := upstream.NewLoader(cfg, accountStore)
+	quotaService := quota.New(cfg)
+	bridge := captcha.NewBridge(cfg)
+	browser := captcha.NewBrowserManager(cfg, 3005)
+	server := api.New(cfg, 3005, admin, accountStore, auth.New(cfg, accountStore), quotaService, accountpool.New(cfg, accountStore, loader, quotaService), loader, bridge, browser, proxy.New(cfg, bridge))
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"oi"}]}`)
+	response, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || payload["object"] != "chat.completion" {
+		t.Fatalf("expected non-streaming chat completion, status=%d payload=%+v", response.StatusCode, payload)
+	}
+	choices := payload["choices"].([]any)
+	message := choices[0].(map[string]any)["message"].(map[string]any)
+	if message["content"] != "ok" {
+		t.Fatalf("unexpected completion content: %+v", payload)
+	}
+	if upstreamBody["stream"] != true {
+		t.Fatalf("upstream body must remain streaming for ZCode SSE parser: %+v", upstreamBody)
 	}
 }
 
@@ -454,7 +511,14 @@ func TestAPIStateReorderAndLogs(t *testing.T) {
 	if err != nil || response.StatusCode != http.StatusOK {
 		t.Fatalf("manual activation failed: %v status=%v", err, response.StatusCode)
 	}
+	var activatePayload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&activatePayload); err != nil {
+		t.Fatal(err)
+	}
 	response.Body.Close()
+	if _, ok := activatePayload["zcode"]; ok {
+		t.Fatalf("manual activation must not apply or report ZCode sync: %+v", activatePayload)
+	}
 	if active := accountStore.Active(); active == nil || active.ID != "two" {
 		t.Fatalf("manual activation was not persisted: %+v", active)
 	}
