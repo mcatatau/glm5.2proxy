@@ -30,46 +30,16 @@ Isso resolve o problema de manter dois pools separados:
 Agora o proxy pode ser a origem de verdade das contas, e o ZCode pode seguir o
 que foi ativado nele.
 
-## Situacao atual e recomendacao pratica
+## Modos de operacao
 
 Hoje o projeto tem dois caminhos de operacao:
 
 - usar a API OpenAI-compatible local;
 - usar o app para trocar a conta diretamente no ZCode.
 
-Os dois funcionam, mas o estado atual do projeto nao e o mesmo para os dois.
-
-### O que hoje esta mais estavel
-
-O caminho mais estavel, no momento, e:
-
-- adicionar as contas no `glm5.2proxy`;
-- escolher a conta no painel;
-- aplicar/trocar essa conta no proprio ZCode;
-- usar o ZCode com a conta ja sincronizada.
-
-### O que hoje esta mais instavel
-
-O modo OpenAI-compatible ainda pode oscilar mais porque ele depende de mais
-camadas:
-
-- traducao OpenAI -> formato aceito pelo upstream;
-- streaming SSE;
-- fila por conta/modelo;
-- consultas de cota;
-- rotacao automatica quando uma conta perde viabilidade;
-- comportamento do proprio upstream da Z.ai/ZCode.
-
-Por isso, a recomendacao operacional atual do projeto e:
-
-- para uso direto no editor/app ZCode, prefira trocar a conta no ZCode pelo
-  `glm5.2proxy`;
-- use a API OpenAI-compatible quando voce realmente precisar integrar clientes
-  externos como Roo Code, Kilo Code, Open WebUI e scripts.
-
-Esse caminho OpenAI-compatible vai continuar recebendo otimizacoes. Ainda ha
-trabalho para reduzir latencia, diminuir estados intermediarios confusos e
-deixar o fluxo mais previsivel. Mesmo assim, o sistema ja esta operacional.
+Use o modo OpenAI-compatible quando quiser integrar clientes externos como Roo
+Code, Kilo Code, Open WebUI e scripts. Use `Aplicar no ZCode` quando quiser
+trocar a conta dentro do app ZCode instalado na maquina.
 
 ## Dois modos de uso
 
@@ -158,8 +128,6 @@ Esse e o botao certo quando voce quer comandar so o ZCode.
 3. Gere uma API key local no painel.
 4. Configure o cliente externo para usar `http://127.0.0.1:3005/v1`.
 5. Use `glm-5.2` ou `glm-5-turbo`.
-6. Se notar instabilidade, volte para a estrategia recomendada: trocar a conta
-   no ZCode e operar por la.
 
 ## Como funciona o bridge do ZCode
 
