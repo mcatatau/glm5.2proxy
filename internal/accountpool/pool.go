@@ -66,6 +66,14 @@ func (p *Pool) Select(ctx context.Context, model models.Model) Selection {
 }
 
 func (p *Pool) SelectSkipping(ctx context.Context, model models.Model, skip map[string]bool) Selection {
+	return p.selectWithRequirement(ctx, model, 0, skip)
+}
+
+func (p *Pool) SelectForRequest(ctx context.Context, model models.Model, requiredUnits int64, skip map[string]bool) Selection {
+	return p.selectWithRequirement(ctx, model, requiredUnits, skip)
+}
+
+func (p *Pool) selectWithRequirement(ctx context.Context, model models.Model, requiredUnits int64, skip map[string]bool) Selection {
 	fallback := p.loader.Load(nil)
 	if !p.cfg.AccountRotation || p.cfg.Authorization != "" {
 		return Selection{Config: fallback}
@@ -81,11 +89,11 @@ func (p *Pool) SelectSkipping(ctx context.Context, model models.Model, skip map[
 		}
 		upstreamConfig := p.loader.Load(&account)
 		balance, err := p.quota.ModelBalanceCached(ctx, upstreamConfig, model, 15*time.Second)
-		exhausted := balance != nil && balance.Available != nil && *balance.Available < p.cfg.AccountMinAvailable
+		exhausted := balance != nil && balance.Available != nil && *balance.Available < p.minimumRequired(requiredUnits)
 		result := inspectedAccount{account: account, config: upstreamConfig, balance: balance, exhausted: exhausted, err: err, stats: p.statsFor(account.ID)}
 		results = append(results, result)
 	}
-	if selected, ok := p.bestEligible(results); ok {
+	if selected, ok := p.bestEligible(results, requiredUnits); ok {
 		active := p.store.Active()
 		previous := ""
 		if active != nil {
@@ -98,7 +106,7 @@ func (p *Pool) SelectSkipping(ctx context.Context, model models.Model, skip map[
 		available := balanceAvailable(selected.balance)
 		return Selection{
 			Config: selected.config, Account: &selected.account, Balance: selected.balance, Rotated: rotated,
-			Reason:       selectionReason(selected.stats, available),
+			Reason:       selectionReason(selected.stats, available, requiredUnits),
 			RequestCount: selected.stats.RequestCount,
 			Available:    availablePointer(available),
 		}
@@ -112,7 +120,8 @@ func (p *Pool) SelectSkipping(ctx context.Context, model models.Model, skip map[
 			return Selection{Config: result.config, Account: &result.account, Warning: fmt.Sprintf("quota unavailable for account %s: %v", result.account.ID, result.err), Reason: "cota indisponivel; usando fallback para nao bloquear o chat"}
 		}
 	}
-	return Selection{Config: results[0].config, Account: &results[0].account, AllExhausted: true}
+	best := bestAvailable(results)
+	return Selection{Config: best.config, Account: &best.account, Balance: best.balance, AllExhausted: true, Available: availablePointer(balanceAvailable(best.balance))}
 }
 
 func (p *Pool) MarkRequest(accountID string) {
@@ -133,7 +142,7 @@ func (p *Pool) statsFor(accountID string) accountStats {
 	return p.stats[accountID]
 }
 
-func (p *Pool) bestEligible(items []inspectedAccount) (inspectedAccount, bool) {
+func (p *Pool) bestEligible(items []inspectedAccount, requiredUnits int64) (inspectedAccount, bool) {
 	var best inspectedAccount
 	found := false
 	activeID := ""
@@ -144,12 +153,19 @@ func (p *Pool) bestEligible(items []inspectedAccount) (inspectedAccount, bool) {
 		if item.err != nil || item.exhausted {
 			continue
 		}
-		if !found || betterCandidate(item, best, activeID) {
+		if !found || p.betterCandidate(item, best, activeID, requiredUnits) {
 			best = item
 			found = true
 		}
 	}
 	return best, found
+}
+
+func (p *Pool) minimumRequired(requiredUnits int64) int64 {
+	if requiredUnits > p.cfg.AccountMinAvailable {
+		return requiredUnits
+	}
+	return p.cfg.AccountMinAvailable
 }
 
 func (p *Pool) Snapshot(ctx context.Context, model models.Model) map[string]any {
@@ -197,7 +213,21 @@ func (p *Pool) ordered() []accounts.Account {
 	return append(append([]accounts.Account{}, storedAccounts[index:]...), storedAccounts[:index]...)
 }
 
-func betterCandidate(left, right inspectedAccount, activeID string) bool {
+func (p *Pool) betterCandidate(left, right inspectedAccount, activeID string, requiredUnits int64) bool {
+	if requiredUnits > 0 {
+		leftAvailable := balanceAvailable(left.balance)
+		rightAvailable := balanceAvailable(right.balance)
+		if leftAvailable != rightAvailable {
+			return leftAvailable > rightAvailable
+		}
+		if left.account.ID == activeID && right.account.ID != activeID {
+			return true
+		}
+		if right.account.ID == activeID && left.account.ID != activeID {
+			return false
+		}
+		return left.account.RegistrationOrder < right.account.RegistrationOrder
+	}
 	if left.stats.RequestCount != right.stats.RequestCount {
 		return left.stats.RequestCount < right.stats.RequestCount
 	}
@@ -224,6 +254,27 @@ func betterCandidate(left, right inspectedAccount, activeID string) bool {
 	return left.account.RegistrationOrder < right.account.RegistrationOrder
 }
 
+func bestAvailable(items []inspectedAccount) inspectedAccount {
+	var best inspectedAccount
+	found := false
+	for _, item := range items {
+		if item.err != nil {
+			continue
+		}
+		if !found || balanceAvailable(item.balance) > balanceAvailable(best.balance) {
+			best = item
+			found = true
+		}
+	}
+	if found {
+		return best
+	}
+	if len(items) > 0 {
+		return items[0]
+	}
+	return inspectedAccount{}
+}
+
 func balanceAvailable(balance *quota.Balance) int64 {
 	if balance == nil || balance.Available == nil {
 		return 0
@@ -239,6 +290,9 @@ func availablePointer(value int64) *int64 {
 	return &copy
 }
 
-func selectionReason(stats accountStats, available int64) string {
+func selectionReason(stats accountStats, available int64, requiredUnits int64) string {
+	if requiredUnits > 0 {
+		return fmt.Sprintf("maior cota disponivel (%d tokens) cobre a request de %d tokens", available, requiredUnits)
+	}
 	return fmt.Sprintf("menos requests no runtime (%d) e %d tokens disponiveis", stats.RequestCount, available)
 }

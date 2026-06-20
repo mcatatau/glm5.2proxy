@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"glm5.2proxy/internal/accountcreator"
 	"glm5.2proxy/internal/accountpool"
 	"glm5.2proxy/internal/accounts"
 	"glm5.2proxy/internal/auth"
@@ -39,9 +40,9 @@ type Server struct {
 	browser       *captcha.BrowserManager
 	proxy         *proxy.Service
 	queue         *requestqueue.Queue
+	creator       *accountcreator.Runner
 	http          *http.Server
 	logs          *logBuffer
-	reserve       *usageReserve
 	zcode         *zcodeBridge
 	zcodeApplyMu  sync.Mutex
 	zcodeApplySeq int64
@@ -65,7 +66,7 @@ func New(
 	browser *captcha.BrowserManager,
 	proxyService *proxy.Service,
 ) *Server {
-	server := &Server{cfg: cfg, port: port, admin: admin, accounts: accountStore, oauth: oauth, quota: quotaService, pool: pool, loader: loader, captcha: bridge, browser: browser, proxy: proxyService, queue: requestqueue.New(), logs: newLogBuffer(500), reserve: newUsageReserve(cfg), zcode: newZCodeBridge()}
+	server := &Server{cfg: cfg, port: port, admin: admin, accounts: accountStore, oauth: oauth, quota: quotaService, pool: pool, loader: loader, captcha: bridge, browser: browser, proxy: proxyService, queue: requestqueue.New(), creator: accountcreator.New(cfg), logs: newLogBuffer(500), zcode: newZCodeBridge()}
 	server.http = &http.Server{Addr: net.JoinHostPort(cfg.Host, strconv.Itoa(port)), Handler: server.routes(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
 	return server
 }
@@ -152,6 +153,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/admin/auth/login/poll", s.loginPoll)
 	mux.HandleFunc("GET /api/admin/logs", s.systemLogs)
 	mux.HandleFunc("GET /api/admin/queue", s.queueSnapshot)
+	mux.HandleFunc("POST /api/admin/account-creator/run", s.runAccountCreator)
 	return s.cors(mux)
 }
 
@@ -217,11 +219,19 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	totalAttempts := 0
 	var lastErr error
 	var staleNotice *accountSwitchNotice
+	accountCreationAttempted := false
+	baseRequirement := openai.EstimateTokenRequirement(body, openai.ToAnthropic(body, nil, model, s.admin.ThinkingFor(""), s.cfg.DefaultMaxTokens))
 	for {
 		previousActive := s.accounts.Active()
-		selection := s.pool.SelectSkipping(r.Context(), model, skipMask(skipped))
+		selection := s.pool.SelectForRequest(r.Context(), model, baseRequirement.Total, skipMask(skipped))
 		if selection.AllExhausted {
 			if s.releaseExpiredAccountSkips(requestID, skipped) {
+				staleNotice = nil
+				continue
+			}
+			if !accountCreationAttempted && s.tryCreateAccountForRequest(r.Context(), requestID, model, baseRequirement, selection.Available) {
+				accountCreationAttempted = true
+				skipped = map[string]accountSkip{}
 				staleNotice = nil
 				continue
 			}
@@ -242,7 +252,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusUnauthorized, "Todas as contas salvas parecem estar com login expirado. Abra o app, faca login novamente em uma conta Z.ai e tente de novo.", "zcode_all_accounts_auth_failed")
 				return
 			}
-			writeError(w, http.StatusTooManyRequests, "all saved ZCode accounts have exhausted quota for "+model.ID, "zcode_all_accounts_exhausted")
+			writeError(w, http.StatusTooManyRequests, fmt.Sprintf("nenhuma conta ZCode tem cota suficiente para %s: request precisa de aproximadamente %d tokens", model.ID, baseRequirement.Total), "zcode_all_accounts_exhausted")
 			return
 		}
 		if !selection.Config.HasAuthorization {
@@ -257,35 +267,31 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			s.logs.add("warn", "account.stale_rotated", fmt.Sprintf("Request %s atingiu %d tentativa(s) sem resposta util na conta %s; mudando para %s e tentando novamente", requestID, staleNotice.Attempts, staleNotice.FromLabel, accounts.Sanitize(*selection.Account).Label))
 			staleNotice = nil
 		}
-		requiredUnits := s.reserve.Minimum(model.ID, s.cfg.AccountMinAvailable)
-		if accountID != "" && selection.Balance != nil && selection.Balance.Available != nil && *selection.Balance.Available < requiredUnits {
-			s.blockAccount(skipped, accountID, accounts.Sanitize(*selection.Account).Label, "reserva insuficiente", false)
+		s.logAutoRotation(requestID, previousActive, selection.Account, model)
+		thinking := s.admin.ThinkingFor(accountID)
+		upstreamBody := openai.ToAnthropic(body, selection.Config.BodyTemplate, model, thinking, s.cfg.DefaultMaxTokens)
+		requirement := openai.EstimateTokenRequirement(body, upstreamBody)
+		if accountID != "" && selection.Balance != nil && selection.Balance.Available != nil && *selection.Balance.Available < requirement.Total {
+			s.blockAccount(skipped, accountID, accounts.Sanitize(*selection.Account).Label, "cota insuficiente para request", false)
 			s.logs.add(
 				"warn",
-				"account.reserve_insufficient",
+				"account.request_quota_insufficient",
 				fmt.Sprintf(
-					"Request %s pulou a conta %s antes do chat: disponivel=%d, minimo dinamico=%d para %s",
+					"Request %s pulou a conta %s antes do chat: disponivel=%d, necessario=%d, max=%d, input_estimado=%d, origem=%s",
 					requestID,
 					accountID,
 					*selection.Balance.Available,
-					requiredUnits,
-					model.ID,
+					requirement.Total,
+					requirement.UpstreamMax,
+					requirement.EstimatedInput,
+					requirement.Source,
 				),
 			)
-			fallback := s.pool.SelectSkipping(r.Context(), model, skipMask(skipped))
-			if !fallback.AllExhausted && fallback.Account != nil {
-				selection = fallback
-				accountID = fallback.Account.ID
-			} else {
-				delete(skipped, accountID)
-			}
+			continue
 		}
-		s.logAutoRotation(requestID, previousActive, selection.Account, model)
 		queueKey := requestqueue.Key(accountID, model.ID)
-		thinking := s.admin.ThinkingFor(accountID)
-		upstreamBody := openai.ToAnthropic(body, selection.Config.BodyTemplate, model, thinking, s.cfg.DefaultMaxTokens)
 		perAccountAttempts := s.perAccountAttemptLimit()
-		s.logs.add("info", "chat.started", fmt.Sprintf("Request %s iniciado com %s usando conta %s; limite de %d tentativa(s) antes de rotacionar", requestID, model.ID, accountID, perAccountAttempts))
+		s.logs.add("info", "chat.started", fmt.Sprintf("Request %s iniciado com %s usando conta %s; request precisa de aproximadamente %d tokens; limite de %d tentativa(s) antes de rotacionar", requestID, model.ID, accountID, requirement.Total, perAccountAttempts))
 		before, _ := s.quota.ModelBalanceCached(r.Context(), selection.Config, model, 15*time.Second)
 		lease, err := s.queue.Acquire(r.Context(), queueKey)
 		if err != nil {
@@ -1096,6 +1102,68 @@ func (s *Server) queueSnapshot(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "zcode.request_queue", "data": s.queue.Snapshot()})
 }
 
+func (s *Server) runAccountCreator(w http.ResponseWriter, r *http.Request) {
+	result, err := s.creator.Run(r.Context(), s.publicBaseURL())
+	if err != nil {
+		s.logs.add("error", "account_creator.failed", fmt.Sprintf("Criacao automatica de conta falhou: %v", err))
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "zcode_account_creator_failed"}, "result": result})
+		return
+	}
+	s.logs.add("info", "account_creator.completed", accountCreatorSuccessMessage("Criacao automatica de conta concluida pelo endpoint administrativo", result))
+	writeJSON(w, http.StatusOK, map[string]any{"object": "zcode.account_creator.run", "result": result})
+}
+
+func (s *Server) tryCreateAccountForRequest(ctx context.Context, requestID string, model models.Model, requirement openai.TokenRequirement, bestAvailable *int64) bool {
+	if requirement.Total > int64(model.DailyTokenAllowance) {
+		s.logs.add("warn", "account_creator.skipped_request_too_large", fmt.Sprintf("Request %s precisa de %d tokens para %s, acima da cota diaria de uma nova conta (%d); automacao de conta nao resolveria", requestID, requirement.Total, model.ID, model.DailyTokenAllowance))
+		return false
+	}
+	if s.creator == nil || !s.creator.Enabled() {
+		s.logs.add("warn", "account_creator.unavailable", fmt.Sprintf("Request %s precisa de %d tokens para %s, mas a criacao automatica de contas esta desativada", requestID, requirement.Total, model.ID))
+		return false
+	}
+	available := "unknown"
+	if bestAvailable != nil {
+		available = strconv.FormatInt(*bestAvailable, 10)
+	}
+	s.logs.add("warn", "account_creator.started", fmt.Sprintf("Request %s precisa de %d tokens para %s; maior cota disponivel=%s; iniciando automacao de criacao/vinculo de conta", requestID, requirement.Total, model.ID, available))
+	result, err := s.creator.Run(ctx, s.publicBaseURL())
+	if err != nil {
+		s.logs.add("error", "account_creator.failed", fmt.Sprintf("Request %s nao conseguiu criar nova conta automaticamente: %v", requestID, err))
+		return false
+	}
+	s.logs.add("info", "account_creator.completed", accountCreatorSuccessMessage(fmt.Sprintf("Request %s concluiu automacao de conta em %s; tentando selecionar conta novamente", requestID, result.Duration), result))
+	return true
+}
+
+func accountCreatorSuccessMessage(prefix string, result accountcreator.Result) string {
+	details := []string{}
+	if result.Label != "" {
+		details = append(details, "label="+result.Label)
+	}
+	if result.Email != "" {
+		details = append(details, "email="+result.Email)
+	}
+	if result.Username != "" {
+		details = append(details, "username="+result.Username)
+	}
+	if result.AccountID != "" {
+		details = append(details, "account_id="+result.AccountID)
+	}
+	if len(details) == 0 {
+		return prefix
+	}
+	return prefix + " (" + strings.Join(details, ", ") + ")"
+}
+
+func (s *Server) publicBaseURL() string {
+	host := s.cfg.Host
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(s.port))
+}
+
 func (s *Server) logQuota(requestID string, upstreamConfig upstream.Config, model models.Model, before *quota.Balance) {
 	var after *quota.Balance
 	for attempt := 0; attempt < s.cfg.QuotaRefreshAttempts; attempt++ {
@@ -1107,9 +1175,6 @@ func (s *Server) logQuota(requestID string, upstreamConfig upstream.Config, mode
 		if changed(before, after) {
 			break
 		}
-	}
-	if usedDelta, ok := deltaInt(before, after); ok {
-		s.reserve.Observe(model.ID, usedDelta)
 	}
 	log.Printf("[quota] request=%s model=%s antiga used=%s remaining=%s available=%s -> atualizada used=%s remaining=%s available=%s deltaUsed=%s", requestID, model.UpstreamID, pointer(before, func(v *quota.Balance) *int64 { return v.Used }), pointer(before, func(v *quota.Balance) *int64 { return v.Remaining }), pointer(before, func(v *quota.Balance) *int64 { return v.Available }), pointer(after, func(v *quota.Balance) *int64 { return v.Used }), pointer(after, func(v *quota.Balance) *int64 { return v.Remaining }), pointer(after, func(v *quota.Balance) *int64 { return v.Available }), delta(before, after))
 	s.logs.add("info", "quota.updated", fmt.Sprintf(
@@ -1299,17 +1364,6 @@ func delta(before, after *quota.Balance) string {
 		return "unknown"
 	}
 	return strconv.FormatInt(*after.Used-*before.Used, 10)
-}
-
-func deltaInt(before, after *quota.Balance) (int64, bool) {
-	if before == nil || after == nil || before.Used == nil || after.Used == nil {
-		return 0, false
-	}
-	value := *after.Used - *before.Used
-	if value <= 0 {
-		return 0, false
-	}
-	return value, true
 }
 
 func (s *Server) Port() int { return s.port }

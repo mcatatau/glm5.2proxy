@@ -37,6 +37,11 @@ type Config struct {
 	AccountRotation        bool
 	AccountMinAvailable    int64
 	AccountRetryCooldown   time.Duration
+	AccountCreatorEnabled  bool
+	AccountCreatorDir      string
+	AccountCreatorCommand  string
+	AccountCreatorTimeout  time.Duration
+	AccountCreatorCooldown time.Duration
 	QuotaLog               bool
 	QuotaRefreshDelay      time.Duration
 	QuotaRefreshAttempts   int
@@ -60,6 +65,8 @@ func Load() Config {
 	if defaultThinkingEnabled {
 		defaultMinAvailable += defaultThinkingBudget
 	}
+	defaultCreatorDir := filepath.Join(home, "Documents", "automação criação de contas", "contas")
+	creatorDir := env("ZCODE_ACCOUNT_CREATOR_DIR", defaultCreatorDir)
 	return Config{
 		Host:                   env("ZCODE_PROXY_HOST", "127.0.0.1"),
 		DefaultPort:            envInt("PORT", envInt("ZCODE_PROXY_PORT", 3005)),
@@ -89,6 +96,11 @@ func Load() Config {
 		AccountRotation:        enabled("ZCODE_ACCOUNT_ROTATION", true),
 		AccountMinAvailable:    int64(envInt("ZCODE_ACCOUNT_MIN_AVAILABLE_UNITS", defaultMinAvailable)),
 		AccountRetryCooldown:   envDurationMS("ZCODE_ACCOUNT_RETRY_COOLDOWN_MS", 300000),
+		AccountCreatorEnabled:  accountCreatorEnabled(creatorDir),
+		AccountCreatorDir:      creatorDir,
+		AccountCreatorCommand:  env("ZCODE_ACCOUNT_CREATOR_COMMAND", "node"),
+		AccountCreatorTimeout:  envDurationMS("ZCODE_ACCOUNT_CREATOR_TIMEOUT_MS", 600000),
+		AccountCreatorCooldown: envDurationMS("ZCODE_ACCOUNT_CREATOR_COOLDOWN_MS", 30000),
 		QuotaLog:               enabled("ZCODE_QUOTA_LOG", true),
 		QuotaRefreshDelay:      envDurationMS("ZCODE_QUOTA_REFRESH_DELAY_MS", 1500),
 		QuotaRefreshAttempts:   envInt("ZCODE_QUOTA_REFRESH_ATTEMPTS", 3),
@@ -97,6 +109,20 @@ func Load() Config {
 		DefaultThinkingBudget:  defaultThinkingBudget,
 		DefaultEffort:          env("ZCODE_EFFORT", "max"),
 	}
+}
+
+func accountCreatorEnabled(dir string) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("ZCODE_ACCOUNT_CREATOR_ENABLED")))
+	if value != "" {
+		return value != "disabled" && value != "false" && value != "0"
+	}
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		return true
+	}
+	return false
 }
 
 func migrateLegacyDataDir(home, dataDir string) {

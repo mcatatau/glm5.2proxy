@@ -209,3 +209,44 @@ func TestAccountPoolPrefersLessUsedAccountBeforeHigherTokenAccount(t *testing.T)
 		t.Fatalf("selection reason should explain stats: %q", selection.Reason)
 	}
 }
+
+func TestAccountPoolSelectForRequestPicksHighestQuotaThatCoversRequest(t *testing.T) {
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/billing/balance" {
+			http.NotFound(w, r)
+			return
+		}
+		availableByToken := map[string]int{
+			"Bearer low-token":  400000,
+			"Bearer high-token": 900000,
+			"Bearer max-token":  700000,
+		}
+		available := availableByToken[r.Header.Get("Authorization")]
+		json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"balances": []any{map[string]any{"show_name": "GLM-5.2", "total_units": 3000000, "used_units": 3000000 - available, "remaining_units": available, "available_units": available}}}})
+	}))
+	defer mock.Close()
+
+	cfg := testConfig(t)
+	cfg.BillingBaseURL = mock.URL + "/billing"
+	cfg.AccountMinAvailable = 1
+	store, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	_, _ = store.Upsert(accounts.User{UserID: "low"}, "low-token", "")
+	_, _ = store.Upsert(accounts.User{UserID: "high"}, "high-token", "")
+	_, _ = store.Upsert(accounts.User{UserID: "max"}, "max-token", "")
+
+	loader := upstream.NewLoader(cfg, store)
+	pool := accountpool.New(cfg, store, loader, quota.New(cfg))
+	model, _ := models.Resolve("glm-5.2")
+	pool.MarkRequest("high")
+	selection := pool.SelectForRequest(context.Background(), model, 500000, nil)
+	if selection.Account == nil || selection.Account.ID != "high" {
+		t.Fatalf("expected highest quota account to cover large request, got %+v", selection)
+	}
+	if selection.Available == nil || *selection.Available != 900000 {
+		t.Fatalf("selection did not expose highest available quota: %+v", selection)
+	}
+	if !strings.Contains(selection.Reason, "maior cota") {
+		t.Fatalf("selection reason should explain quota-first choice: %q", selection.Reason)
+	}
+}
