@@ -21,7 +21,7 @@ func testConfig(t *testing.T) config.Config {
 		CaptchaPreferredClient: "headless-browser", HeadlessEnabled: false,
 		HeadlessProfileDir: filepath.Join(dir, "browser"), HeadlessRestartDelay: 10 * time.Millisecond,
 		UpstreamTimeout: 5 * time.Second, RetryMaxAttempts: 3, RetryBaseDelay: time.Millisecond, RetryMaxDelay: time.Millisecond,
-		AccountRotation: true, AccountMinAvailable: 1, QuotaLog: false,
+		AccountRotation: true, AccountMinAvailable: 1, AccountRetryCooldown: 5 * time.Minute, QuotaLog: false,
 		QuotaRefreshDelay: time.Millisecond, QuotaRefreshAttempts: 1,
 		DefaultMaxTokens: 64000, DefaultThinkingEnabled: true, DefaultThinkingBudget: 32000, DefaultEffort: "max",
 	}

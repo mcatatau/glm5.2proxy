@@ -177,6 +177,29 @@ func (s *Server) modelCapabilities(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "zcode.model_capabilities", "data": models.List()})
 }
 
+func (s *Server) SelectStartupAccount(ctx context.Context) {
+	model, ok := models.Resolve("glm-5.2")
+	if !ok {
+		return
+	}
+	previous := s.accounts.Active()
+	selection := s.pool.SelectSkipping(ctx, model, nil)
+	if selection.Account == nil || selection.AllExhausted || !selection.Config.HasAuthorization {
+		s.logs.add("warn", "account.startup_selection_skipped", "Proxy iniciado sem selecionar conta automaticamente: nenhuma conta elegivel para "+model.ID)
+		return
+	}
+	label := accounts.Sanitize(*selection.Account).Label
+	if selection.Rotated {
+		from := "nenhuma conta anterior"
+		if previous != nil {
+			from = accounts.Sanitize(*previous).Label
+		}
+		s.logs.add("info", "account.startup_selected", fmt.Sprintf("Proxy iniciado com %s para %s: %s; conta anterior era %s", label, model.ID, selection.Reason, from))
+		return
+	}
+	s.logs.add("info", "account.startup_selected", fmt.Sprintf("Proxy iniciado mantendo %s para %s: %s", label, model.ID, selection.Reason))
+}
+
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
 	if err := decodeJSON(w, r, &body); err != nil {
@@ -189,12 +212,32 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requestID := randomID()
-	skipped := map[string]bool{}
+	skipped := map[string]accountSkip{}
 	authSkipped := false
+	totalAttempts := 0
+	var lastErr error
+	var staleNotice *accountSwitchNotice
 	for {
 		previousActive := s.accounts.Active()
-		selection := s.pool.SelectSkipping(r.Context(), model, skipped)
+		selection := s.pool.SelectSkipping(r.Context(), model, skipMask(skipped))
 		if selection.AllExhausted {
+			if s.releaseExpiredAccountSkips(requestID, skipped) {
+				staleNotice = nil
+				continue
+			}
+			if s.allAccountsSkipped(skipped) && s.hasRetryableAccountSkip(skipped) {
+				if !s.waitForAccountRetryCooldown(r.Context(), requestID, skipped) {
+					writeError(w, http.StatusRequestTimeout, "request cancelled while waiting for account retry cooldown", "zcode_account_retry_wait_cancelled")
+					return
+				}
+				staleNotice = nil
+				continue
+			}
+			if staleNotice != nil && lastErr != nil {
+				s.logs.add("error", "chat.failed", fmt.Sprintf("Request %s falhou apos %d tentativa(s) distribuidas: todas as contas testadas encerraram o stream sem resposta util", requestID, totalAttempts))
+				writeProxyErrorWithDiagnostic(w, lastErr, totalAttempts, nil)
+				return
+			}
 			if authSkipped {
 				writeError(w, http.StatusUnauthorized, "Todas as contas salvas parecem estar com login expirado. Abra o app, faca login novamente em uma conta Z.ai e tente de novo.", "zcode_all_accounts_auth_failed")
 				return
@@ -210,9 +253,13 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		if selection.Account != nil {
 			accountID = selection.Account.ID
 		}
+		if staleNotice != nil && accountID != "" {
+			s.logs.add("warn", "account.stale_rotated", fmt.Sprintf("Request %s atingiu %d tentativa(s) sem resposta util na conta %s; mudando para %s e tentando novamente", requestID, staleNotice.Attempts, staleNotice.FromLabel, accounts.Sanitize(*selection.Account).Label))
+			staleNotice = nil
+		}
 		requiredUnits := s.reserve.Minimum(model.ID, s.cfg.AccountMinAvailable)
 		if accountID != "" && selection.Balance != nil && selection.Balance.Available != nil && *selection.Balance.Available < requiredUnits {
-			skipped[accountID] = true
+			s.blockAccount(skipped, accountID, accounts.Sanitize(*selection.Account).Label, "reserva insuficiente", false)
 			s.logs.add(
 				"warn",
 				"account.reserve_insufficient",
@@ -225,7 +272,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 					model.ID,
 				),
 			)
-			fallback := s.pool.SelectSkipping(r.Context(), model, skipped)
+			fallback := s.pool.SelectSkipping(r.Context(), model, skipMask(skipped))
 			if !fallback.AllExhausted && fallback.Account != nil {
 				selection = fallback
 				accountID = fallback.Account.ID
@@ -237,7 +284,8 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		queueKey := requestqueue.Key(accountID, model.ID)
 		thinking := s.admin.ThinkingFor(accountID)
 		upstreamBody := openai.ToAnthropic(body, selection.Config.BodyTemplate, model, thinking, s.cfg.DefaultMaxTokens)
-		s.logs.add("info", "chat.started", fmt.Sprintf("Request %s iniciado com %s usando conta %s", requestID, model.ID, accountID))
+		perAccountAttempts := s.perAccountAttemptLimit()
+		s.logs.add("info", "chat.started", fmt.Sprintf("Request %s iniciado com %s usando conta %s; limite de %d tentativa(s) antes de rotacionar", requestID, model.ID, accountID, perAccountAttempts))
 		before, _ := s.quota.ModelBalanceCached(r.Context(), selection.Config, model, 15*time.Second)
 		lease, err := s.queue.Acquire(r.Context(), queueKey)
 		if err != nil {
@@ -248,6 +296,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		if lease.Position() > 0 {
 			s.logs.add("info", "queue.released", fmt.Sprintf("Request %s liberado apos aguardar fila %s", requestID, queueKey))
 		}
+		s.pool.MarkRequest(accountID)
 		onSuccess := func() {
 			s.logs.add("info", "chat.completed", fmt.Sprintf("Request %s concluido com %s", requestID, model.ID))
 			if s.cfg.QuotaLog {
@@ -255,8 +304,9 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if streaming(body) {
-			attempts, err, started := s.streamChat(w, r, selection.Config, upstreamBody, model, onSuccess)
+			attempts, err, started := s.streamChat(w, r, selection.Config, upstreamBody, model, perAccountAttempts, onSuccess)
 			lease.Release()
+			totalAttempts += attempts
 			if err == nil {
 				return
 			}
@@ -267,12 +317,17 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				authSkipped = true
 				continue
 			}
-			diagnostic := s.logChatFailure(requestID, attempts, err, body, upstreamBody)
-			writeProxyErrorWithDiagnostic(w, err, attempts, diagnostic)
+			if !started && s.skipStaleConnectionAccount(accountID, selection.Account, attempts, err, skipped, &staleNotice) {
+				lastErr = err
+				continue
+			}
+			diagnostic := s.logChatFailure(requestID, totalAttempts, err, body, upstreamBody)
+			writeProxyErrorWithDiagnostic(w, err, totalAttempts, diagnostic)
 			return
 		}
-		completion, attempts, err := s.proxy.Collect(r.Context(), selection.Config, upstreamBody)
+		completion, attempts, err := s.proxy.CollectWithAttemptLimit(r.Context(), selection.Config, upstreamBody, perAccountAttempts)
 		lease.Release()
+		totalAttempts += attempts
 		if err != nil {
 			if s.skipQuotaExhaustedAccount(requestID, accountID, model, err, skipped) {
 				continue
@@ -281,8 +336,12 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				authSkipped = true
 				continue
 			}
-			diagnostic := s.logChatFailure(requestID, attempts, err, body, upstreamBody)
-			writeProxyErrorWithDiagnostic(w, err, attempts, diagnostic)
+			if s.skipStaleConnectionAccount(accountID, selection.Account, attempts, err, skipped, &staleNotice) {
+				lastErr = err
+				continue
+			}
+			diagnostic := s.logChatFailure(requestID, totalAttempts, err, body, upstreamBody)
+			writeProxyErrorWithDiagnostic(w, err, totalAttempts, diagnostic)
 			return
 		}
 		message := map[string]any{"role": "assistant", "content": completion.Text}
@@ -295,7 +354,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, upstreamConfig upstream.Config, body map[string]any, model models.Model, onSuccess func()) (int, error, bool) {
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, upstreamConfig upstream.Config, body map[string]any, model models.Model, maxAttempts int, onSuccess func()) (int, error, bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported", "internal_error")
@@ -314,7 +373,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, upstreamConf
 	}
 	id := "chatcmpl-" + randomID()
 	finalSent := false
-	attempts, err := s.proxy.Stream(r.Context(), upstreamConfig, body, func(event proxy.StreamEvent) error {
+	attempts, err := s.proxy.StreamWithAttemptLimit(r.Context(), upstreamConfig, body, maxAttempts, func(event proxy.StreamEvent) error {
 		start()
 		if event.FinishReason != "" {
 			if finalSent {
@@ -346,6 +405,19 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, upstreamConf
 	return attempts, nil, true
 }
 
+type accountSwitchNotice struct {
+	FromLabel string
+	Attempts  int
+}
+
+type accountSkip struct {
+	Label      string
+	Reason     string
+	BlockedAt  time.Time
+	RetryAfter time.Time
+	Retryable  bool
+}
+
 func (s *Server) logAutoRotation(requestID string, previousActive *accounts.Account, selected *accounts.Account, model models.Model) {
 	if selected == nil {
 		return
@@ -365,22 +437,148 @@ func (s *Server) logAutoRotation(requestID string, previousActive *accounts.Acco
 	)
 }
 
-func (s *Server) skipQuotaExhaustedAccount(requestID, accountID string, model models.Model, err error, skipped map[string]bool) bool {
-	if accountID == "" || skipped[accountID] || !proxy.IsQuotaExhausted(err) {
+func (s *Server) skipStaleConnectionAccount(accountID string, account *accounts.Account, attempts int, err error, skipped map[string]accountSkip, notice **accountSwitchNotice) bool {
+	if accountID == "" || !proxy.IsStaleConnection(err) {
 		return false
 	}
-	skipped[accountID] = true
+	label := accountID
+	if account != nil {
+		label = accounts.Sanitize(*account).Label
+	}
+	s.blockAccount(skipped, accountID, label, "stream vazio", true)
+	*notice = &accountSwitchNotice{FromLabel: label, Attempts: attempts}
+	return true
+}
+
+func (s *Server) perAccountAttemptLimit() int {
+	if s.cfg.RetryMaxAttempts > 0 && s.cfg.RetryMaxAttempts < 4 {
+		return s.cfg.RetryMaxAttempts
+	}
+	return 4
+}
+
+func (s *Server) skipQuotaExhaustedAccount(requestID, accountID string, model models.Model, err error, skipped map[string]accountSkip) bool {
+	if accountID == "" || !proxy.IsQuotaExhausted(err) {
+		return false
+	}
+	s.blockAccount(skipped, accountID, accountID, "cota esgotada", false)
 	s.logs.add("warn", "account.quota_exhausted", fmt.Sprintf("Request %s detectou cota esgotada para %s na conta %s; tentando proxima conta", requestID, model.ID, accountID))
 	return true
 }
 
-func (s *Server) skipAuthFailedAccount(requestID, accountID string, err error, skipped map[string]bool) bool {
-	if accountID == "" || skipped[accountID] || !proxy.IsAuthFailed(err) {
+func (s *Server) skipAuthFailedAccount(requestID, accountID string, err error, skipped map[string]accountSkip) bool {
+	if accountID == "" || !proxy.IsAuthFailed(err) {
 		return false
 	}
-	skipped[accountID] = true
+	s.blockAccount(skipped, accountID, accountID, "auth invalida", false)
 	s.logs.add("warn", "account.auth_failed", fmt.Sprintf("Request %s recebeu erro de login na conta %s; tentando proxima conta salva", requestID, accountID))
 	return true
+}
+
+func (s *Server) blockAccount(skipped map[string]accountSkip, accountID, label, reason string, retryable bool) {
+	if accountID == "" {
+		return
+	}
+	if _, exists := skipped[accountID]; exists {
+		return
+	}
+	now := time.Now()
+	skipped[accountID] = accountSkip{Label: label, Reason: reason, BlockedAt: now, RetryAfter: now.Add(s.accountRetryCooldown()), Retryable: retryable}
+}
+
+func skipMask(skipped map[string]accountSkip) map[string]bool {
+	if len(skipped) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(skipped))
+	for accountID := range skipped {
+		out[accountID] = true
+	}
+	return out
+}
+
+func (s *Server) accountRetryCooldown() time.Duration {
+	if s.cfg.AccountRetryCooldown <= 0 {
+		return 5 * time.Minute
+	}
+	return s.cfg.AccountRetryCooldown
+}
+
+func (s *Server) releaseExpiredAccountSkips(requestID string, skipped map[string]accountSkip) bool {
+	if !s.allAccountsSkipped(skipped) {
+		return false
+	}
+	now := time.Now()
+	released := []string{}
+	for accountID, item := range skipped {
+		if item.Retryable && !now.Before(item.RetryAfter) {
+			delete(skipped, accountID)
+			released = append(released, item.Label)
+		}
+	}
+	if len(released) == 0 {
+		return false
+	}
+	s.logs.add("info", "account.retry_cooldown_released", fmt.Sprintf("Request %s liberou novamente %s apos cooldown de %s; todas as contas ja tinham sido testadas", requestID, strings.Join(released, ", "), s.accountRetryCooldown()))
+	return true
+}
+
+func (s *Server) waitForAccountRetryCooldown(ctx context.Context, requestID string, skipped map[string]accountSkip) bool {
+	next, ok := nextRetryAfter(skipped)
+	if !ok {
+		return false
+	}
+	wait := time.Until(next)
+	if wait < 0 {
+		wait = 0
+	}
+	s.logs.add("warn", "account.retry_cooldown_wait", fmt.Sprintf("Request %s testou todas as contas disponiveis; aguardando %s para tentar novamente contas bloqueadas em memoria", requestID, wait.Round(time.Second)))
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return s.releaseExpiredAccountSkips(requestID, skipped)
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Server) allAccountsSkipped(skipped map[string]accountSkip) bool {
+	if len(skipped) == 0 {
+		return false
+	}
+	accounts := s.accounts.Accounts()
+	if len(accounts) == 0 {
+		return false
+	}
+	for _, account := range accounts {
+		if _, ok := skipped[account.ID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) hasRetryableAccountSkip(skipped map[string]accountSkip) bool {
+	for _, item := range skipped {
+		if item.Retryable {
+			return true
+		}
+	}
+	return false
+}
+
+func nextRetryAfter(skipped map[string]accountSkip) (time.Time, bool) {
+	var next time.Time
+	for _, item := range skipped {
+		if !item.Retryable {
+			continue
+		}
+		if next.IsZero() || item.RetryAfter.Before(next) {
+			next = item.RetryAfter
+		}
+	}
+	return next, !next.IsZero()
 }
 
 func (s *Server) logChatFailure(requestID string, attempts int, err error, clientBody, upstreamBody map[string]any) map[string]any {

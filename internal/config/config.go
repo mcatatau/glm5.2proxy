@@ -36,6 +36,7 @@ type Config struct {
 	RetryMaxDelay          time.Duration
 	AccountRotation        bool
 	AccountMinAvailable    int64
+	AccountRetryCooldown   time.Duration
 	QuotaLog               bool
 	QuotaRefreshDelay      time.Duration
 	QuotaRefreshAttempts   int
@@ -87,6 +88,7 @@ func Load() Config {
 		RetryMaxDelay:          envDurationMS("ZCODE_RETRY_MAX_DELAY_MS", 60000),
 		AccountRotation:        enabled("ZCODE_ACCOUNT_ROTATION", true),
 		AccountMinAvailable:    int64(envInt("ZCODE_ACCOUNT_MIN_AVAILABLE_UNITS", defaultMinAvailable)),
+		AccountRetryCooldown:   envDurationMS("ZCODE_ACCOUNT_RETRY_COOLDOWN_MS", 300000),
 		QuotaLog:               enabled("ZCODE_QUOTA_LOG", true),
 		QuotaRefreshDelay:      envDurationMS("ZCODE_QUOTA_REFRESH_DELAY_MS", 1500),
 		QuotaRefreshAttempts:   envInt("ZCODE_QUOTA_REFRESH_ATTEMPTS", 3),

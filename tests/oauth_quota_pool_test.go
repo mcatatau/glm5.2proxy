@@ -171,3 +171,41 @@ func TestAccountPoolRotatesWhenAvailableIsBelowRequestReserve(t *testing.T) {
 		t.Fatalf("unexpected quota check order: %+v", checkedTokens)
 	}
 }
+
+func TestAccountPoolPrefersLessUsedAccountBeforeHigherTokenAccount(t *testing.T) {
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/billing/balance" {
+			http.NotFound(w, r)
+			return
+		}
+		token := r.Header.Get("Authorization")
+		available := 900
+		if token == "Bearer used-token" {
+			available = 3000000
+		}
+		json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"balances": []any{map[string]any{"show_name": "GLM-5.2", "total_units": 3000000, "used_units": 3000000 - available, "remaining_units": available, "available_units": available}}}})
+	}))
+	defer mock.Close()
+
+	cfg := testConfig(t)
+	cfg.BillingBaseURL = mock.URL + "/billing"
+	store, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	_, _ = store.Upsert(accounts.User{UserID: "used"}, "used-token", "")
+	_, _ = store.Upsert(accounts.User{UserID: "new"}, "new-token", "")
+
+	loader := upstream.NewLoader(cfg, store)
+	pool := accountpool.New(cfg, store, loader, quota.New(cfg))
+	pool.MarkRequest("used")
+	model, _ := models.Resolve("glm-5.2")
+	selection := pool.Select(context.Background(), model)
+	if selection.Account == nil || selection.Account.ID != "new" {
+		t.Fatalf("expected less-used new account to win balanced selection: %+v", selection)
+	}
+	if selection.RequestCount != 0 || selection.Available == nil || *selection.Available != 900 {
+		t.Fatalf("selection stats were not exposed correctly: %+v", selection)
+	}
+	if !strings.Contains(selection.Reason, "menos requests") {
+		t.Fatalf("selection reason should explain stats: %q", selection.Reason)
+	}
+}

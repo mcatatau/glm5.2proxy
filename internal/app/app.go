@@ -58,6 +58,11 @@ func (s *Service) Run(ctx context.Context) error {
 	s.browser.Start(ctx)
 	errorChannel := make(chan error, 1)
 	go func() { errorChannel <- s.server.Serve(listener) }()
+	go func() {
+		startupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		s.server.SelectStartupAccount(startupCtx)
+	}()
 	select {
 	case err := <-errorChannel:
 		s.browser.Stop()

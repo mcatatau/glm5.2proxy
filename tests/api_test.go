@@ -445,6 +445,156 @@ func TestChatRotatesAccountWhenUpstreamReportsExpiredAuth(t *testing.T) {
 	}
 }
 
+func TestChatRotatesAccountAfterPerAccountStaleLimit(t *testing.T) {
+	var chatTokens []string
+	fakeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/messages":
+			token := r.Header.Get("Authorization")
+			chatTokens = append(chatTokens, token)
+			w.Header().Set("Content-Type", "text/event-stream")
+			if token == "Bearer token-one" {
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+				return
+			}
+			_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case r.URL.Path == "/billing/balance":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"balances":[{"show_name":"GLM-5.2","total_units":3000000,"used_units":0,"remaining_units":3000000,"available_units":3000000}]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fakeUpstream.Close()
+
+	cfg := testConfig(t)
+	cfg.RetryMaxAttempts = 11
+	cfg.UpstreamURL = fakeUpstream.URL + "/messages"
+	cfg.BillingBaseURL = fakeUpstream.URL + "/billing"
+	admin, _ := state.NewAdminStore(cfg.AdminPath, 3005, state.ThinkingSettings{Enabled: true, BudgetTokens: 32000, Effort: "max"})
+	accountStore, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	_, _ = accountStore.Upsert(accounts.User{UserID: "one"}, "token-one", "")
+	_, _ = accountStore.Upsert(accounts.User{UserID: "two"}, "token-two", "")
+	loader := upstream.NewLoader(cfg, accountStore)
+	quotaService := quota.New(cfg)
+	bridge := captcha.NewBridge(cfg)
+	browser := captcha.NewBrowserManager(cfg, 3005)
+	server := api.New(cfg, 3005, admin, accountStore, auth.New(cfg, accountStore), quotaService, accountpool.New(cfg, accountStore, loader, quotaService), loader, bridge, browser, proxy.New(cfg, bridge))
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"oi"}],"stream":false}`)
+	response, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected stale-rotated request to succeed, got %d", response.StatusCode)
+	}
+	if strings.Join(chatTokens, ",") != "Bearer token-one,Bearer token-one,Bearer token-one,Bearer token-one,Bearer token-two" {
+		t.Fatalf("unexpected per-account retry/rotation pattern: %+v", chatTokens)
+	}
+
+	logsResponse, err := http.Get(httpServer.URL + "/api/admin/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs map[string]any
+	if err := json.NewDecoder(logsResponse.Body).Decode(&logs); err != nil {
+		t.Fatal(err)
+	}
+	logsResponse.Body.Close()
+	found := false
+	for _, raw := range logs["data"].([]any) {
+		entry := raw.(map[string]any)
+		if entry["event"] == "account.stale_rotated" && strings.Contains(entry["message"].(string), "4 tentativa") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected account.stale_rotated log, got %+v", logs)
+	}
+}
+
+func TestChatRetriesStaleAccountAfterAllAccountsCooldown(t *testing.T) {
+	var chatTokens []string
+	fakeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/messages":
+			token := r.Header.Get("Authorization")
+			chatTokens = append(chatTokens, token)
+			w.Header().Set("Content-Type", "text/event-stream")
+			if len(chatTokens) <= 8 {
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+				return
+			}
+			_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case r.URL.Path == "/billing/balance":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"balances":[{"show_name":"GLM-5.2","total_units":3000000,"used_units":0,"remaining_units":3000000,"available_units":3000000}]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fakeUpstream.Close()
+
+	cfg := testConfig(t)
+	cfg.RetryMaxAttempts = 11
+	cfg.AccountRetryCooldown = time.Millisecond
+	cfg.UpstreamURL = fakeUpstream.URL + "/messages"
+	cfg.BillingBaseURL = fakeUpstream.URL + "/billing"
+	admin, _ := state.NewAdminStore(cfg.AdminPath, 3005, state.ThinkingSettings{Enabled: true, BudgetTokens: 32000, Effort: "max"})
+	accountStore, _ := accounts.NewStore(cfg.CredentialsPath, cfg.CredentialSecret)
+	_, _ = accountStore.Upsert(accounts.User{UserID: "one"}, "token-one", "")
+	_, _ = accountStore.Upsert(accounts.User{UserID: "two"}, "token-two", "")
+	loader := upstream.NewLoader(cfg, accountStore)
+	quotaService := quota.New(cfg)
+	bridge := captcha.NewBridge(cfg)
+	browser := captcha.NewBrowserManager(cfg, 3005)
+	server := api.New(cfg, 3005, admin, accountStore, auth.New(cfg, accountStore), quotaService, accountpool.New(cfg, accountStore, loader, quotaService), loader, bridge, browser, proxy.New(cfg, bridge))
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"oi"}],"stream":false}`)
+	response, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected cooldown retry to succeed, got %d", response.StatusCode)
+	}
+	pattern := strings.Join(chatTokens, ",")
+	if pattern != "Bearer token-one,Bearer token-one,Bearer token-one,Bearer token-one,Bearer token-two,Bearer token-two,Bearer token-two,Bearer token-two,Bearer token-one" {
+		t.Fatalf("unexpected cooldown retry pattern: %s", pattern)
+	}
+
+	logsResponse, err := http.Get(httpServer.URL + "/api/admin/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs map[string]any
+	if err := json.NewDecoder(logsResponse.Body).Decode(&logs); err != nil {
+		t.Fatal(err)
+	}
+	logsResponse.Body.Close()
+	releaseFound := false
+	for _, raw := range logs["data"].([]any) {
+		entry := raw.(map[string]any)
+		if entry["event"] == "account.retry_cooldown_released" {
+			releaseFound = true
+		}
+	}
+	if !releaseFound {
+		t.Fatalf("expected cooldown release log, got %+v", logs)
+	}
+}
+
 func TestAdmissionConcurrencyErrorUsesFriendlyMessage(t *testing.T) {
 	fakeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
