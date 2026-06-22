@@ -1,6 +1,9 @@
 /// <reference types="vite/client" />
 
 interface Window {
+  runtime?: {
+    BrowserOpenURL?: (url: string) => void
+  }
   go?: {
     main?: {
       Desktop?: {

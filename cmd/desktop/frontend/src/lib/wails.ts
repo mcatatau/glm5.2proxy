@@ -1,13 +1,14 @@
-import { BrowserOpenURL } from '../../wailsjs/runtime/runtime'
-
 export async function openExternalURL(url: string): Promise<void> {
   if (!/^https?:\/\//i.test(url)) {
     throw new Error('A URL de autenticacao retornada e invalida')
   }
 
   try {
-    BrowserOpenURL(url)
-    return
+    const browserOpenURL = window.runtime?.BrowserOpenURL
+    if (browserOpenURL) {
+      browserOpenURL(url)
+      return
+    }
   } catch {
     // Wails runtime unavailable.
   }
